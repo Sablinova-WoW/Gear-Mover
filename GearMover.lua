@@ -6,6 +6,11 @@ if GearMoverNS and GearMoverNS.Style then GearMoverNS.Style.UseSkin("classic") e
 local addon = CreateFrame("Frame", "GearMoverEventFrame")
 local panel
 local createPanel
+local refreshPanel
+local layoutMode = 1 -- 1=full, 2=compact text, 3=icons
+local transferDirection = "deposit"
+local skipCompletedBoE = false
+local skipAccountAttunedBoE = false
 local configPanel -- Blizzard Interface > AddOns settings page
 local configRegistered = false
 local configuredTabs = {}
@@ -72,6 +77,79 @@ local function isSoulbound(bag, slot)
     bindTip:Hide()
     return false
 end
+-- Original binding must be read from the Synastria item template, not
+-- today's soulbound state. Mirror AttuneSight's documented tag semantics.
+local boeTemplateCache, boeTemplateEntries = {}, 0
+local boeTip = CreateFrame("GameTooltip", "GearMoverOriginalBoETooltip", UIParent, "GameTooltipTemplate")
+boeTip:SetOwner(UIParent,"ANCHOR_NONE")
+local function originalBoE(link, bag, slot)
+    local id = link and tonumber(link:match("item:(%d+)"))
+    if not id then return nil end
+    if boeTemplateCache[id]~=nil then return boeTemplateCache[id] end
+    if synastriaReady and type(_G.GetItemTagsCustom)=="function" and bit and bit.band then
+        local ok, _, tags2, tags3 = pcall(_G.GetItemTagsCustom,id)
+        if ok and type(tags3)=="number" then
+            local known
+            if bit.band(tags3,1)~=0 then known=true
+            elseif type(tags2)=="number" and bit.band(tags2,128)~=0 then known=false end
+            if known~=nil then
+                if boeTemplateEntries>=256 then boeTemplateCache={};boeTemplateEntries=0 end
+                boeTemplateCache[id]=known
+                boeTemplateEntries=boeTemplateEntries+1
+                return known
+            end
+        end
+    end
+    -- Current unsoulbound BoEs still show their original binding in tooltips.
+    -- Once soulbound, original BoE can only be established by custom tags.
+    if bag ~= nil and slot ~= nil then
+        boeTip:SetOwner(UIParent,"ANCHOR_NONE")
+        boeTip:ClearLines()
+        boeTip:SetBagItem(bag,slot)
+        for i=2,boeTip:NumLines() do
+            local text=_G["GearMoverOriginalBoETooltipTextLeft"..i]
+            if text and text:GetText()==ITEM_BIND_ON_EQUIP then
+                boeTip:Hide()
+                return true
+            end
+        end
+        boeTip:Hide()
+    end
+    -- A missing BoE tooltip line does not reliably classify the original
+    -- binding: tooltip/item data may not have loaded yet. With protection
+    -- enabled, fail closed rather than risking an unwanted deposit.
+    return nil -- No reliable template classification available.
+end
+local function completedLinkAttunement(link)
+    if not synastriaReady then return nil end
+    if type(_G.GetItemLinkAttuneProgress)=="function" then
+        local ok, n=pcall(_G.GetItemLinkAttuneProgress,link)
+        if ok and type(n)=="number" then return n>=100 end
+    end
+    if type(_G.GetItemAttuneProgress)=="function" and
+       type(_G.CustomExtractItemAffix)=="function" and
+       type(_G.CustomExtractItemBonus)=="function" and
+       bit and type(bit.rshift)=="function" then
+        local id=tonumber(link:match("item:(%d+)"))
+        local okA,affix=pcall(_G.CustomExtractItemAffix,link)
+        local okB,bonus=pcall(_G.CustomExtractItemBonus,link)
+        if id and okA and okB and type(affix)=="number" and type(bonus)=="number" then
+            local ok,n=pcall(_G.GetItemAttuneProgress,id,affix,bit.rshift(bonus,12))
+            if ok and type(n)=="number" then return n>=100 end
+        end
+    end
+    -- Unknown affix data must not be mistaken for an unattuned variant.
+    return nil
+end
+local function accountVariantAttuned(link)
+    local id=link and tonumber(link:match("item:(%d+)"))
+    if not id or not synastriaReady or type(_G.HasAttunedAnyVariantOfItem)~="function" then return nil end
+    local ok, result=pcall(_G.HasAttunedAnyVariantOfItem,id)
+    if not ok then return nil end
+    if result==true or result==1 then return true end
+    if result==false or result==0 or result==nil then return false end
+    return nil
+end
 local function msg(s) DEFAULT_CHAT_FRAME:AddMessage("|cff55ddaaGear Mover:|r " .. s) end
 
 local categories = {
@@ -119,10 +197,21 @@ local function itemCategory(link)
 end
 
 -- Optional deposit restrictions. Defaults preserve all previous matching equipment.
-local function allowedDeposit(link)
+local function allowedDeposit(link, bag, slot)
     if not link then return false end
     local _, _, quality = GetItemInfo(link)
     if minDepositQuality > 0 and (not quality or quality < minDepositQuality) then return false end
+    if skipCompletedBoE or skipAccountAttunedBoE then
+        local boe=originalBoE(link,bag,slot)
+        if boe==true then
+            if skipCompletedBoE and completedLinkAttunement(link)~=false then return false end
+            if skipAccountAttunedBoE and accountVariantAttuned(link)~=false then return false end
+        elseif boe==nil then
+            -- The user explicitly asked us to protect potentially saleable BoEs.
+            -- Unknown binding is skipped rather than risking an accidental deposit.
+            return false
+        end
+    end
     if skipMythic then
         local itemID=tonumber(string.match(link, "item:(%d+)"))
         if itemID and type(_G.GetItemTagsCustom)=="function" and _G.bit then
@@ -338,6 +427,7 @@ local function stop(reason)
         observationTick = 0
         pendingObservations = {}
         observations = {}
+        if refreshPanel then refreshPanel() end
         if reason then msg(reason .. " (attempted: " .. finished .. ", source changes observed: " .. confirmed .. ", awaiting/uncertain: " .. outstanding .. ", skipped: " .. skipped .. ")") end
     end
 end
@@ -347,7 +437,7 @@ local function buildQueue(direction, key, mode, tab)
         for bag=0,4 do
             for slot=1,(GetContainerNumSlots(bag) or 0) do
                 local link=GetContainerItemLink(bag,slot)
-                if itemCategory(link)==key and allowedDeposit(link) then table.insert(q,{bag=bag,slot=slot,link=link}) end
+                if itemCategory(link)==key and allowedDeposit(link,bag,slot) then table.insert(q,{bag=bag,slot=slot,link=link}) end
             end
         end
     elseif mode=="guild" then
@@ -379,6 +469,7 @@ local function newJob(direction, mode, stages)
     job={direction=direction,mode=mode,stages=stages,stage=1,
          index=1,moved=0,skipped=0,reserved={},guildPlanned={},
          phase="select",tabWait=0}
+    if refreshPanel then refreshPanel() end
 end
 local function addDepositStages(stages,key,includeOpenTab)
     local tabs=selectedTabs(key)
@@ -401,7 +492,7 @@ local function hasDepositableItems(key)
     for bag=0,4 do
         for slot=1,(GetContainerNumSlots(bag) or 0) do
             local link=GetContainerItemLink(bag,slot)
-            if link and itemCategory(link)==key and allowedDeposit(link) then
+            if link and itemCategory(link)==key and allowedDeposit(link,bag,slot) then
                 local _,_,locked=GetContainerItemInfo(bag,slot)
                 if not locked and not isSoulbound(bag,slot) then return true end
             end
@@ -441,6 +532,7 @@ local function start(direction,key)
     observations={confirmed=0};pendingObservations={}
     job={direction=direction,category=key,mode=mode,tab=tab,queue=queue,
          index=1,moved=0,skipped=0,reserved={},guildPlanned={},phase="transfer",tabWait=0}
+    if refreshPanel then refreshPanel() end
     msg(string.format("Starting %s: %d %s stacks.",direction,#queue,tabLabels[key]))
 end
 
@@ -633,7 +725,7 @@ addon:SetScript("OnUpdate",function(self,elapsed)
         local sourceBag,sourceSlot=entry.bag,entry.slot
         local link=GetContainerItemLink(sourceBag,sourceSlot)
         if link and link==entry.link and itemCategory(link)==job.category and
-           (job.direction~="deposit" or allowedDeposit(link)) and
+           (job.direction~="deposit" or allowedDeposit(link,sourceBag,sourceSlot)) and
            (job.direction~="withdraw" or job.category~="Weapon" or isAttunableForCurrentCharacter(link)) then
             local _,_,locked=GetContainerItemInfo(sourceBag,sourceSlot)
             if locked then job.skipped=job.skipped+1
@@ -662,7 +754,7 @@ addon:SetScript("OnUpdate",function(self,elapsed)
     elseif job.direction=="deposit" then
         local tab=job.tab
         local link=GetContainerItemLink(entry.bag,entry.slot)
-        if link and itemCategory(link)==job.category and link==entry.link and allowedDeposit(link) then
+        if link and itemCategory(link)==job.category and link==entry.link and allowedDeposit(link,entry.bag,entry.slot) then
             local _,_,locked=GetContainerItemInfo(entry.bag,entry.slot)
             if locked or isSoulbound(entry.bag,entry.slot) then job.skipped=job.skipped+1
             else
@@ -731,15 +823,6 @@ addon:SetScript("OnUpdate",function(self,elapsed)
     if job.index>#job.queue then advanceStage(job,job.overflowBlocked==true) end
 end)
 
-local function makeButton(parent,label,x,y,width,handler)
-    local b=CreateFrame("Button",nil,parent,"UIPanelButtonTemplate")
-    b:SetSize(width,23)
-    b:SetPoint("TOPLEFT",parent,"TOPLEFT",x,y)
-    b:SetText(label)
-    b:SetScript("OnClick",handler)
-    return b
-end
-
 local function guildConfigKey()
     local guild=GetGuildInfo("player") or "NoGuild"
     local realm=GetRealmName() or "UnknownRealm"
@@ -756,9 +839,84 @@ local function saveTabs()
     end
     stored.minDepositQuality=minDepositQuality
     stored.skipMythic=skipMythic
+    stored.skipCompletedBoE=skipCompletedBoE
+    stored.skipAccountAttunedBoE=skipAccountAttunedBoE
     -- Speed is a global player preference; all guilds and personal banks use it.
     GearMoverDB.transferMs=transferMs
     GearMoverDB.guilds[guildConfigKey()]=stored
+end
+-- UI preferences are shared by all characters on this WoW account.
+-- Migrate the previous character-scoped data once, preferring the current
+-- character so upgrading does not unexpectedly change the visible layout.
+local function uiSettings()
+    GearMoverDB=GearMoverDB or {}
+    if type(GearMoverDB.uiGlobal) ~= "table" then
+        local old=GearMoverDB.ui
+        local previous
+        if type(old)=="table" then
+            local key=(GetRealmName() or "UnknownRealm").."/"..(UnitName("player") or "Unknown")
+            if type(old[key])=="table" then
+                previous=old[key]
+            else
+                -- If this character has no legacy preferences, use an existing
+                -- character's saved layout rather than dropping all prior settings.
+                local keys={}
+                for candidate,settings in pairs(old) do
+                    if type(candidate)=="string" and type(settings)=="table" then
+                        keys[#keys+1]=candidate
+                    end
+                end
+                table.sort(keys)
+                if keys[1] then previous=old[keys[1]] end
+            end
+        end
+        GearMoverDB.uiGlobal={}
+        if previous then
+            for _,field in ipairs({"layout","direction","x","y","scale"}) do
+                GearMoverDB.uiGlobal[field]=previous[field]
+            end
+        end
+    end
+    -- Per-character UI settings are obsolete. Discard them after migration
+    -- rather than retaining stale SavedVariables and Lua tables forever.
+    GearMoverDB.ui=nil
+    return GearMoverDB.uiGlobal
+end
+local function savePanelPosition()
+    if not panel or not panel.GetCenter or not UIParent.GetCenter then return end
+    local x,y=panel:GetCenter()
+    local cx,cy=UIParent:GetCenter()
+    if not x or not cx then return end
+    local prefs=uiSettings()
+    prefs.x=x-cx
+    prefs.y=y-cy
+end
+local function restorePanelPosition()
+    if not panel then return end
+    local prefs=uiSettings()
+    panel:ClearAllPoints()
+    local x=type(prefs.x)=="number" and prefs.x or 285
+    local y=type(prefs.y)=="number" and prefs.y or 0
+    -- Avoid a window that is completely offscreen after a resolution change.
+    local scale=panel:GetScale() or 1
+    local limitX=math.max(0,(UIParent:GetWidth() or 1024)/2-80*scale)
+    local limitY=math.max(0,(UIParent:GetHeight() or 768)/2-35*scale)
+    x=math.max(-limitX,math.min(limitX,x))
+    y=math.max(-limitY,math.min(limitY,y))
+    panel:SetPoint("CENTER",UIParent,"CENTER",x,y)
+end
+local function loadUiPreference()
+    local prefs=uiSettings()
+    local mode=tonumber(prefs.layout)
+    layoutMode=(mode and mode>=1 and mode<=3) and math.floor(mode) or 1
+    transferDirection=prefs.direction=="withdraw" and "withdraw" or "deposit"
+    -- SetScale affects the entire window, preserving the proportions of each
+    -- layout and avoiding different button hitboxes after a user resize.
+    local scale=tonumber(prefs.scale) or 1
+    if scale~=scale then scale=1 end -- Reject invalid NaN persisted by another addon.
+    panel:SetScale(math.max(0.65,math.min(1.65,scale)))
+    restorePanelPosition()
+    if refreshPanel then refreshPanel() end
 end
 local function loadTabs()
     if not GearMoverDB then GearMoverDB={guilds={}} end
@@ -771,6 +929,8 @@ local function loadTabs()
     minDepositQuality=tonumber(stored.minDepositQuality) or 0
     if minDepositQuality<0 or minDepositQuality>5 then minDepositQuality=0 end
     skipMythic=stored.skipMythic==true
+    skipCompletedBoE=stored.skipCompletedBoE==true
+    skipAccountAttunedBoE=stored.skipAccountAttunedBoE==true
     for _,key in ipairs(tabKeys) do
         local value=stored[key]
         local list={}
@@ -858,196 +1018,188 @@ end
 
 local function createConfigPanel()
     if configPanel then return end
-    configPanel=CreateFrame("Frame", "GearMoverInterfaceOptions", UIParent)
-    configPanel.name="Gear Mover"
+    local S=GearMoverNS and GearMoverNS.Style
+    assert(S and S.Button and S.Check and S.Dropdown and S.Slider and S.Frame,
+        "MaterialCraftUI Classic failed to load")
+    -- Register only a fully constructed settings page.
+    local page=CreateFrame("Frame", nil, UIParent)
+    page.name="Gear Mover"
 
-    local title=configPanel:CreateFontString(nil,"ARTWORK","GameFontNormalLarge")
-    title:SetPoint("TOPLEFT",18,-18)
-    title:SetText("Gear Mover")
-    local tabHeading=configPanel:CreateFontString(nil,"ARTWORK","GameFontNormal")
-    tabHeading:SetPoint("TOPLEFT",22,-54)
-    tabHeading:SetText("Guild-bank tab assignments")
-
-    -- Settings help is displayed only on hover; no change to transfer behavior.
-    local function attachHelp(control, heading, lines)
-        if not control or type(control.HookScript) ~= "function" then return end
-        control:HookScript("OnEnter", function(self)
-            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    local function label(text,x,y,font)
+        local f=page:CreateFontString(nil,"ARTWORK",font or "GameFontHighlight")
+        f:SetPoint("TOPLEFT",page,"TOPLEFT",x,y)
+        f:SetText(text)
+        return f
+    end
+    local function help(control,title,lines)
+        control:HookScript("OnEnter",function(self)
+            GameTooltip:SetOwner(self,"ANCHOR_RIGHT")
             GameTooltip:ClearLines()
-            GameTooltip:AddLine(heading, 1, 0.82, 0)
-            for _,line in ipairs(lines) do
-                GameTooltip:AddLine(line, 1, 1, 1, true)
-            end
+            GameTooltip:AddLine(title,1,0.82,0)
+            for _,t in ipairs(lines) do GameTooltip:AddLine(t,1,1,1,true) end
             GameTooltip:Show()
         end)
-        control:HookScript("OnLeave", function()
-            GameTooltip:Hide()
-        end)
+        control:HookScript("OnLeave",function()GameTooltip:Hide()end)
     end
-    local function attachDropdownHelp(menu, heading, lines)
-        attachHelp(menu, heading, lines)
-        -- UIDropDownMenuTemplate has a separate clickable arrow button.
-        if menu.GetName then
-            attachHelp(_G[menu:GetName() .. "Button"], heading, lines)
-        end
-    end
-
-    -- Each category may use more than one destination tab. Classic-skinned
-    -- MaterialCraftUI checkboxes are bundled; no external UI addon required.
-    local style = GearMoverNS and GearMoverNS.Style
-    local tabInputs={}
-    local pendingTabs={}
-    for tab=1,6 do
-        local head=configPanel:CreateFontString(nil,"ARTWORK","GameFontNormalSmall")
-        head:SetPoint("TOPLEFT",174+(tab-1)*54,-72)
-        head:SetText("Tab "..tab)
+    label("Gear Mover",20,-18,"GameFontNormalLarge")
+    label("Guild-bank tab assignments",24,-56,"GameFontNormal")
+    local tabInputs,pendingTabs,selectors={},{},{}
+    local function summary(key)
+        local parts={}
+        for n=1,6 do if pendingTabs[key][n] then parts[#parts+1]=tostring(n) end end
+        return #parts>0 and ("Tabs "..table.concat(parts,", ")) or "Unassigned"
     end
     for i,key in ipairs(tabKeys) do
         local categoryKey=key
-        local rowY=-96-(i-1)*26
-        local label=configPanel:CreateFontString(nil,"ARTWORK","GameFontHighlight")
-        label:SetPoint("TOPLEFT",30,rowY-3)
-        label:SetText(tabLabels[key])
-        tabInputs[key]={}
+        local y=-84-(i-1)*29
+        label(tabLabels[key],36,y-4)
         pendingTabs[key]={}
+        tabInputs[key]={}
+        local selector=S.Button(page,"Unassigned","secondary",188)
+        selector:SetPoint("TOPLEFT",page,"TOPLEFT",160,y)
+        selectors[key]=selector
+        local popup=CreateFrame("Frame",nil,page)
+        popup:SetSize(232,92)
+        popup:SetPoint("TOPLEFT",selector,"BOTTOMLEFT",0,-2)
+        popup:SetFrameStrata("FULLSCREEN_DIALOG")
+        popup:SetFrameLevel(page:GetFrameLevel()+15)
+        popup:EnableMouse(true)
+        S.Frame(popup,"menu")
+        popup.owner=selector
+        S.TrackPopup(popup)
+        popup:Hide()
         for tab=1,6 do
             local tabNumber=tab
-            local box=style.Check(configPanel,20,function(self)
-                self:SetChecked(not self.on)
-                pendingTabs[categoryKey][tabNumber]=self.on
+            local col=(tab-1)%3
+            local row=math.floor((tab-1)/3)
+            local box=S.Check(popup,18,function(self)
+                local value=not self.on
+                self:SetChecked(value)
+                pendingTabs[categoryKey][tabNumber]=value
+                selector:SetText(summary(categoryKey))
             end)
-            box:SetPoint("TOPLEFT",178+(tab-1)*54,rowY+3)
-            box.tooltipText="Deposit "..tabLabels[categoryKey].." into tab "..tabNumber
+            box:SetPoint("TOPLEFT",popup,"TOPLEFT",16+col*74,-15-row*34)
+            box.tooltipText="Tab "..tabNumber.." for "..tabLabels[categoryKey]
+            local t=popup:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+            t:SetPoint("LEFT",box,"RIGHT",5,0)
+            t:SetText(tostring(tabNumber))
             tabInputs[categoryKey][tabNumber]=box
         end
+        selector:SetScript("OnClick",function()
+            local open=popup:IsShown()
+            S.CloseMenus()
+            if not open then popup:Show() end
+        end)
+        selector:HookScript("OnHide",function()popup:Hide()end)
+        help(selector,tabLabels[key].." destinations",{
+            "Select any number of guild-bank tabs.",
+            "Lowest selected number is tried first; others are overflow."
+        })
     end
 
-    local rulesHeading=configPanel:CreateFontString(nil,"ARTWORK","GameFontNormal")
-    rulesHeading:SetPoint("TOPLEFT",22,-226)
-    rulesHeading:SetText("Deposit rules")
-    local qualityLabel=configPanel:CreateFontString(nil,"ARTWORK","GameFontHighlight")
-    qualityLabel:SetPoint("TOPLEFT",30,-256)
-    qualityLabel:SetText("Minimum item quality")
-    local qualityMenu=CreateFrame("Frame","GearMoverQualityDropdown",configPanel,"UIDropDownMenuTemplate")
-    qualityMenu:SetPoint("TOPLEFT",115,-248)
-    UIDropDownMenu_SetWidth(qualityMenu,116)
-    local qualityNames={[0]="Any quality (0)",[1]="Common (1)",[2]="Uncommon (2)",[3]="Rare (3)",[4]="Epic (4)",[5]="Legendary (5)"}
+    label("Deposit rules",24,-236,"GameFontNormal")
+    label("Minimum quality",36,-261)
+    local qualityNames={[0]="Any quality (0)",[1]="Common (1)",[2]="Uncommon (2)",
+        [3]="Rare (3)",[4]="Epic (4)",[5]="Legendary (5)"}
     local pendingQuality=0
-    UIDropDownMenu_Initialize(qualityMenu,function(self,level)
-        for n=0,5 do
-            local value=n
-            local info=UIDropDownMenu_CreateInfo()
-            info.text=qualityNames[value]
-            info.value=value
-            info.checked=(pendingQuality==value)
-            info.func=function()
-                pendingQuality=value
-                UIDropDownMenu_SetSelectedValue(qualityMenu,value)
-                UIDropDownMenu_SetText(qualityMenu,qualityNames[value])
-            end
-            UIDropDownMenu_AddButton(info,level)
-        end
+    local quality
+    quality=S.Dropdown(page,158,function(value)
+        pendingQuality=value
+        quality:SetText(qualityNames[value])
     end)
-    attachDropdownHelp(qualityMenu, "Minimum deposit quality", {
-        "0 = No quality restriction",
-        "1 = Common",
-        "2 = Uncommon",
-        "3 = Rare",
-        "4 = Epic",
-        "5 = Legendary",
-        "Applies to deposits only."
-    })
-    local mythicBox=CreateFrame("CheckButton",nil,configPanel,"UICheckButtonTemplate")
-    mythicBox:SetPoint("TOPLEFT",278,-249)
-    local mythicText=configPanel:CreateFontString(nil,"ARTWORK","GameFontHighlight")
-    mythicText:SetPoint("LEFT",mythicBox,"RIGHT",4,0)
-    mythicText:SetText("Skip Mythic on deposit")
-    attachHelp(mythicBox, "Skip Mythic equipment", {
-        "When checked, Gear Mover will not deposit items identified as Mythic by Synastria.",
-        "If Mythic status cannot be determined safely, that item is also skipped.",
-        "Does not affect withdrawals or the item categories."
+    quality:SetPoint("TOPLEFT",page,"TOPLEFT",162,-254)
+    local qOptions={}
+    for n=0,5 do qOptions[#qOptions+1]={value=n,text=qualityNames[n]} end
+    quality:SetOptions(qOptions)
+    help(quality,"Minimum deposit quality",{
+        "Only deposit items at or above the chosen quality.",
+        "0 = Any quality (including Poor)", "1 = Common", "2 = Uncommon",
+        "3 = Rare", "4 = Epic", "5 = Legendary",
+        "Applies only to deposits."
     })
 
-    local speedLabel=configPanel:CreateFontString(nil,"ARTWORK","GameFontNormal")
-    speedLabel:SetPoint("TOPLEFT",30,-312)
-    speedLabel:SetText("Transfer interval")
-    local speedValue=configPanel:CreateFontString(nil,"ARTWORK","GameFontHighlight")
-    speedValue:SetPoint("LEFT",speedLabel,"RIGHT",12,0)
-    local speedSlider=CreateFrame("Slider","GearMoverTransferSpeedSlider",configPanel,"OptionsSliderTemplate")
-    speedSlider:SetWidth(240)
-    speedSlider:SetPoint("TOPLEFT",45,-339)
-    speedSlider:SetMinMaxValues(10,200)
-    speedSlider:SetValueStep(1)
-    _G[speedSlider:GetName().."Low"]:SetText("10 ms")
-    _G[speedSlider:GetName().."High"]:SetText("200 ms")
-    _G[speedSlider:GetName().."Text"]:SetText("")
+    -- Keep all three deposit protections on one vertical axis. These are
+    -- independently saved; moving them must not change their semantics.
+    local function checkSetting(y,name,details)
+        local cb=S.Check(page,18,function(self) self:SetChecked(not self.on) end)
+        cb:SetPoint("TOPLEFT",page,"TOPLEFT",42,y)
+        local text=page:CreateFontString(nil,"OVERLAY","GameFontHighlight")
+        text:SetPoint("LEFT",cb,"RIGHT",10,0)
+        text:SetText(name)
+        help(cb,name,details)
+        -- Make the label itself discoverable without making it clickable.
+        return cb
+    end
+    local mythicBox=checkSetting(-279,"Skip Mythics",{
+        "Skips depositing Mythic Gear. Doesn't affect withdrawals."
+    })
+    local completedBox=checkSetting(-303,"Skip attuned BoEs",{
+        "Skips attuned BoEs to sell/move manually"
+    })
+    local accountBox=checkSetting(-327,"Skip attuned variant BoEs",{
+        "Skips BoE gear you've attuned a variant affix of to sell/manually move"
+    })
+
+    label("Transfer interval",36,-358,"GameFontNormal")
     local pendingMs=80
-    speedSlider:SetScript("OnValueChanged",function(self,value)
-        pendingMs=math.max(10,math.min(200,math.floor(value+0.5)))
-        speedValue:SetText(pendingMs.." ms"..(pendingMs==80 and " (default)" or ""))
-    end)
-    attachHelp(speedSlider,"Transfer interval",{
-        "Delay between transfer attempts, for deposits and withdrawals.",
-        "80 ms is the default. Smaller values may be limited by FPS or server responses.",
-        "10-49 ms is experimental. Server safety limits are not documented."
+    local slider=S.Slider(page,248,10,200,1,function(v)
+        pendingMs=math.floor(v+0.5)
+    end,function(v)return tostring(math.floor(v+0.5)).." ms" end)
+    slider:SetPoint("TOPLEFT",page,"TOPLEFT",46,-378)
+    help(slider,"Transfer interval",{
+        "Delay between item transfer attempts (10-200 ms).",
+        "80 ms is the default. Lower values may cause failed moves or throttling.",
+        "Below 50 ms is experimental."
     })
-    local speedWarning=configPanel:CreateFontString(nil,"ARTWORK","GameFontNormalSmall")
-    speedWarning:SetPoint("TOPLEFT",30,-371)
-    speedWarning:SetTextColor(1,0.25,0.25)
-    speedWarning:SetText("WARNING: Below 50 ms may cause instability.")
+    local warning=label("WARNING: Below 50 ms may cause instability.",38,-412,"GameFontNormalSmall")
+    warning:SetTextColor(1,0.25,0.25)
 
-    local saveButton=makeButton(configPanel,"Save settings",362,-402,119,function()
-        if job then
-            msg("Stop the current transfer before changing guild-bank settings.")
-            return
-        end
+    local revert=S.Button(page,"Revert changes","secondary",126,function()
+        S.CloseMenus()
+        page:Hide()
+        page:Show()
+    end)
+    revert:SetPoint("BOTTOMRIGHT",page,"BOTTOMRIGHT",-18,15)
+    local save=S.Button(page,"Save settings","primary",126,function()
+        if job then msg("Stop the active transfer before saving settings.") return end
         configuredTabs={}
         for _,key in ipairs(tabKeys) do
             local chosen={}
-            for tab=1,6 do
-                if pendingTabs[key][tab] then chosen[#chosen+1]=tab end
-            end
+            for t=1,6 do if pendingTabs[key][t] then chosen[#chosen+1]=t end end
             configuredTabs[key]=chosen
         end
         minDepositQuality=pendingQuality
-        skipMythic=mythicBox:GetChecked() and true or false
+        skipMythic=mythicBox.on==true
+        skipCompletedBoE=completedBox.on==true
+        skipAccountAttunedBoE=accountBox.on==true
         transferMs=pendingMs
         interval=transferMs/1000
         saveTabs()
+        S.CloseMenus()
         msg("Guild tab assignments and deposit rules saved.")
     end)
-    attachHelp(saveButton, "Save settings", {
-        "Save all guild-tab assignments and deposit filters for this guild and realm.",
-        "Finish or stop any active transfer before saving changes."
-    })
-    local restoreButton=makeButton(configPanel,"Revert changes",490,-402,120,function()
-        configPanel:Hide()
-        configPanel:Show()
-    end)
-    attachHelp(restoreButton, "Revert changes", {
-        "Discard unsaved edits on this page and reload your last saved choices.",
-        "Does not undo item transfers or erase previously saved settings."
-    })
-
-    configPanel:SetScript("OnShow",function()
+    save:SetPoint("RIGHT",revert,"LEFT",-8,0)
+    page:SetScript("OnShow",function()
         for _,key in ipairs(tabKeys) do
-            local selected={}
-            for _,tab in ipairs(configuredTabList(key)) do selected[tab]=true end
-            pendingTabs[key]={}
-            for tab=1,6 do
-                local on=selected[tab] or false
-                pendingTabs[key][tab]=on
-                tabInputs[key][tab]:SetChecked(on)
+            local chosen={}
+            for _,t in ipairs(configuredTabList(key)) do chosen[t]=true end
+            for n=1,6 do
+                local on=chosen[n] or false
+                pendingTabs[key][n]=on
+                tabInputs[key][n]:SetChecked(on)
             end
+            selectors[key]:SetText(summary(key))
         end
         pendingQuality=minDepositQuality
-        UIDropDownMenu_SetSelectedValue(qualityMenu,pendingQuality)
-        UIDropDownMenu_SetText(qualityMenu,qualityNames[pendingQuality])
+        quality:SetText(qualityNames[pendingQuality] or qualityNames[0])
         mythicBox:SetChecked(skipMythic)
+        completedBox:SetChecked(skipCompletedBoE)
+        accountBox:SetChecked(skipAccountAttunedBoE)
         pendingMs=transferMs
-        speedSlider:SetValue(transferMs)
-        speedValue:SetText(transferMs.." ms"..(transferMs==80 and " (default)" or ""))
+        slider:SetValue(transferMs)
     end)
+    page:HookScript("OnHide",function()S.CloseMenus()end)
+    configPanel=page
 end
 
 -- Create the panel independently of PLAYER_LOGIN, and register only once.
@@ -1076,31 +1228,292 @@ registerConfigPanel = function()
     return true
 end
 
-createPanel = function()
-    if panel then return end
-    panel=CreateFrame("Frame","GearMoverPanel",UIParent)
-    panel:SetWidth(332); panel:SetHeight(205)
-    panel:SetPoint("CENTER",UIParent,"CENTER",285,0)
-    panel:SetFrameStrata("DIALOG")
-    panel:SetMovable(true); panel:EnableMouse(true)
-    panel:RegisterForDrag("LeftButton")
-    panel:SetScript("OnDragStart",function(self) self:StartMoving() end)
-    panel:SetScript("OnDragStop",function(self) self:StopMovingOrSizing() end)
-    panel:SetBackdrop({bgFile="Interface\\DialogFrame\\UI-DialogBox-Background",edgeFile="Interface\\DialogFrame\\UI-DialogBox-Border",tile=true,tileSize=32,edgeSize=32,insets={left=11,right=12,top=12,bottom=11}})
-    local title=panel:CreateFontString(nil,"OVERLAY","GameFontNormal")
-    title:SetPoint("TOP",panel,"TOP",0,-14); title:SetText("Gear Mover")
-    for i,c in ipairs(categories) do
-        local y=-35-(i-1)*24
-        local label=panel:CreateFontString(nil,"OVERLAY","GameFontNormal")
-        label:SetWidth(52);label:SetJustifyH("LEFT")
-        label:SetPoint("TOPLEFT",panel,"TOPLEFT",17,y-5);label:SetText(c.label)
-        makeButton(panel,"Deposit",78,y,104,function()start("deposit",c.key)end)
-        makeButton(panel,"Withdraw",189,y,112,function()start("withdraw",c.key)end)
+-- All layouts are thin, Classic-skinned views over the existing transfer engine.
+-- A layout/direction change never calls a bank or transfer API.
+local ART="Interface\\AddOns\\Gear Mover\\Textures\\"
+local ICONS={Cloth=ART.."Cloth",Leather=ART.."Leather",Mail=ART.."Mail",
+    Plate=ART.."Plate",Weapon=ART.."Weapons",Deposit=ART.."Bank",
+    Withdraw=ART.."Inventory",All=ART.."All"}
+local GREEN={0.16,0.93,0.25}
+local AMBER={1,0.67,0.10}
+local function tooltipButton(b,textFn)
+    local enter=function(self)
+        GameTooltip:SetOwner(self,"ANCHOR_TOP")
+        GameTooltip:SetText(type(textFn)=="function" and textFn() or textFn)
+        GameTooltip:Show()
     end
-    -- Progress and completion are still reported in chat; no idle 'Ready' label.
-    makeButton(panel,"Deposit All",15,-167,99,function()startAll()end)
-    makeButton(panel,"Withdraw All",118,-167,112,function()startWithdrawAll()end)
-    makeButton(panel,"Stop",235,-167,79,function()stop("Stopped by user")end)
+    -- MaterialCraftUI buttons already have mouse enter/leave scripts for
+    -- their Classic hover/pressed states. Hook them instead of overriding.
+    if b.kind then
+        b:HookScript("OnEnter",enter)
+    else
+        b:SetScript("OnEnter",enter)
+        b:SetScript("OnLeave",function()GameTooltip:Hide()end)
+    end
+end
+local function actionAll()
+    if job then stop("Stopped by user")
+    elseif transferDirection=="deposit" then startAll()
+    else startWithdrawAll() end
+end
+local function categoryAction(key)start(transferDirection,key)end
+
+createPanel=function()
+    if panel then return end
+    local S=GearMoverNS and GearMoverNS.Style
+    assert(S and S.Frame and S.Button,"MaterialCraftUI Classic UI missing")
+    panel=CreateFrame("Frame","GearMoverPanel",UIParent)
+    panel:SetFrameStrata("DIALOG")
+    panel:SetMovable(true)
+    panel:EnableMouse(true)
+    panel:RegisterForDrag("LeftButton")
+    panel:SetClampedToScreen(true)
+    panel:SetScript("OnDragStart",function(self)self:StartMoving()end)
+    panel:SetScript("OnDragStop",function(self)self:StopMovingOrSizing();savePanelPosition()end)
+    S.Frame(panel,"window")
+
+    -- Bottom-right drag handle scales the entire panel, so every layout keeps
+    -- its pixel alignment and click targets. Unlike Resize/Sizing, this does
+    -- not reflow or stretch MaterialCraftUI's fixed-size Classic controls.
+    local resizeGrip=CreateFrame("Button",nil,panel)
+    resizeGrip:SetSize(17,17)
+    resizeGrip:SetPoint("BOTTOMRIGHT",panel,"BOTTOMRIGHT",-5,5)
+    resizeGrip:SetFrameLevel(panel:GetFrameLevel()+12)
+    local resizeArt=resizeGrip:CreateTexture(nil,"ARTWORK")
+    resizeArt:SetAllPoints(resizeGrip)
+    resizeArt:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+    resizeGrip:SetNormalTexture(resizeArt)
+    resizeGrip:RegisterForClicks("LeftButtonDown","LeftButtonUp")
+    local resizing=false
+    local startX,startY,startScale
+    local function stopResize(self)
+        if not resizing then return end
+        resizing=false
+        self:SetScript("OnUpdate",nil)
+        local scale=panel:GetScale() or 1
+        uiSettings().scale=scale
+        savePanelPosition()
+    end
+    -- Keep one reusable update callback instead of allocating a new closure
+    -- every time the resize handle is pressed. It is inactive when not dragging.
+    local function updateResize()
+        if not resizing then return end
+        local x,y=GetCursorPosition()
+        local parentScale=UIParent:GetEffectiveScale()
+        if not parentScale or parentScale<=0 then return end
+        local dx=(x-startX)/parentScale
+        local dy=(startY-y)/parentScale
+        -- Dragging outward grows the window; inward shrinks it.
+        local factor=math.max(dx/math.max(1,panel:GetWidth()),dy/math.max(1,panel:GetHeight()))
+        local inward=math.min(dx/math.max(1,panel:GetWidth()),dy/math.max(1,panel:GetHeight()))
+        if dx<0 and dy<0 then factor=inward end
+        local scale=math.max(0.65,math.min(1.65,startScale+factor))
+        if scale~=panel:GetScale() then panel:SetScale(scale) end
+    end
+    resizeGrip:SetScript("OnMouseDown",function(self,button)
+        if button~="LeftButton" then return end
+        resizing=true
+        startX,startY=GetCursorPosition()
+        startScale=panel:GetScale() or 1
+        self:SetScript("OnUpdate",updateResize)
+    end)
+    resizeGrip:SetScript("OnMouseUp",stopResize)
+    resizeGrip:SetScript("OnHide",stopResize)
+    tooltipButton(resizeGrip,"Drag to resize Gear Mover")
+
+    local views={}
+    for n=1,3 do
+        local f=CreateFrame("Frame",nil,panel)
+        f:SetAllPoints(panel)
+        views[n]=f
+    end
+    local function textButton(parent,text,width,x,y,handler)
+        local b=S.Button(parent,text,"secondary",width,handler)
+        b:SetPoint("TOPLEFT",parent,"TOPLEFT",x,y)
+        return b
+    end
+    -- Bagnon/oGlow-style additive OVERLAY, but shaped for the control.
+    -- The shared 9-slice texture keeps its corners at a fixed size for both
+    -- rectangular Classic buttons and square artwork; its middle is transparent.
+    -- Unlike UI-ActionButton-Border stretched over a rectangle, it does not
+    -- color the button label or the center of the user's icon.
+    local glowTexture=ART.."SoftEdgeGlow"
+    local function edgeGlow(button,opacity)
+        local parts={}
+        local cuts={0,0.25,0.75,1}
+        local cap=12
+        local pad=4
+        local fragments={
+            {"TOPLEFT",1,1},{"TOP",2,1},{"TOPRIGHT",3,1},
+            {"LEFT",1,2},{"RIGHT",3,2},
+            {"BOTTOMLEFT",1,3},{"BOTTOM",2,3},{"BOTTOMRIGHT",3,3}
+        }
+        for _,part in ipairs(fragments) do
+            local tex=button:CreateTexture(nil,"OVERLAY")
+            tex:SetTexture(glowTexture)
+            tex:SetBlendMode("ADD")
+            local col,row=part[2],part[3]
+            tex:SetTexCoord(cuts[col],cuts[col+1],cuts[row],cuts[row+1])
+            if col==1 then
+                tex:SetPoint("LEFT",button,"LEFT",-pad,0)
+                tex:SetWidth(cap)
+            elseif col==3 then
+                tex:SetPoint("RIGHT",button,"RIGHT",pad,0)
+                tex:SetWidth(cap)
+            else
+                tex:SetPoint("LEFT",button,"LEFT",cap-pad,0)
+                tex:SetPoint("RIGHT",button,"RIGHT",pad-cap,0)
+            end
+            if row==1 then
+                tex:SetPoint("TOP",button,"TOP",0,pad)
+                tex:SetHeight(cap)
+            elseif row==3 then
+                tex:SetPoint("BOTTOM",button,"BOTTOM",0,-pad)
+                tex:SetHeight(cap)
+            else
+                tex:SetPoint("TOP",button,"TOP",0,pad-cap)
+                tex:SetPoint("BOTTOM",button,"BOTTOM",0,cap-pad)
+            end
+            tex:SetAlpha(0)
+            parts[#parts+1]=tex
+        end
+        button.edgeGlow=parts
+        button.edgeOpacity=opacity or 0.85
+        return button
+    end
+    local function paintDirection(button,active,color)
+        button:SetKind(active and "selected" or "secondary")
+        for _,tex in ipairs(button.edgeGlow) do
+            tex:SetVertexColor(color[1],color[2],color[3])
+            tex:SetAlpha(active and button.edgeOpacity or 0)
+        end
+    end
+    local function separator(parent,x,y,height)
+        local t=parent:CreateTexture(nil,"ARTWORK")
+        t:SetTexture("Interface\\Buttons\\WHITE8X8")
+        t:SetVertexColor(0.72,0.60,0.35,0.65)
+        t:SetPoint("TOPLEFT",parent,"TOPLEFT",x,y)
+        t:SetSize(1,height)
+    end
+    local title=views[1]:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    title:SetPoint("TOP",panel,"TOP",0,-15)
+    title:SetText("Gear Mover")
+    for i,c in ipairs(categories) do
+        local y=-39-(i-1)*26
+        local key=c.key
+        local lab=views[1]:CreateFontString(nil,"OVERLAY","GameFontHighlight")
+        lab:SetPoint("TOPLEFT",views[1],"TOPLEFT",20,y-4)
+        lab:SetText(c.label)
+        textButton(views[1],"Deposit",105,84,y,function()start("deposit",key)end)
+        textButton(views[1],"Withdraw",105,198,y,function()start("withdraw",key)end)
+    end
+    textButton(views[1],"Deposit All",93,18,-173,startAll)
+    textButton(views[1],"Withdraw All",98,118,-173,startWithdrawAll)
+    local fullStop=textButton(views[1],"Stop",87,224,-173,function()stop("Stopped by user")end)
+
+    local function setDirection(direction)
+        if transferDirection~=direction then
+            transferDirection=direction
+            uiSettings().direction=direction
+            refreshPanel()
+        end
+    end
+    -- Compact mode is two short, precisely aligned rows, no redundant heading.
+    local compactDeposit=edgeGlow(textButton(views[2],"Deposit",98,12,-16,function()setDirection("deposit")end))
+    local compactWithdraw=edgeGlow(textButton(views[2],"Withdraw",98,116,-16,function()setDirection("withdraw")end))
+    local compactCategories={}
+    for i,c in ipairs(categories) do
+        local key=c.key
+        local b=edgeGlow(textButton(views[2],({"Cl","Le","Ma","Pl","Wp"})[i],35,12+(i-1)*44,-48,
+            function()categoryAction(key)end))
+        tooltipButton(b,function()return (transferDirection=="deposit" and "Deposit " or "Withdraw ")..tabLabels[key]end)
+        compactCategories[#compactCategories+1]=b
+    end
+    local compactAll=edgeGlow(textButton(views[2],"All",42,234,-48,actionAll))
+    tooltipButton(compactAll,function()return job and "Stop transfer" or (transferDirection=="deposit" and "Deposit All" or "Withdraw All")end)
+
+    -- Original user-supplied artwork, converted to TGA only for client texture compatibility.
+    local function imageButton(parent,x,texture,fn,textFn)
+        local b=CreateFrame("Button",nil,parent)
+        b:SetSize(34,34)
+        b:SetPoint("TOPLEFT",parent,"TOPLEFT",x,-15)
+        local art=b:CreateTexture(nil,"ARTWORK")
+        art:SetAllPoints()
+        art:SetTexture(texture)
+        b.art=art
+        -- Square buttons do not need eight separate 9-slice regions.
+        -- The source glow has a transparent middle; a single centered overlay
+        -- preserves the artwork and reduces retained UI textures per icon.
+        local border=b:CreateTexture(nil,"OVERLAY")
+        border:SetTexture(glowTexture)
+        border:SetBlendMode("ADD")
+        border:SetPoint("TOPLEFT",b,"TOPLEFT",-4,4)
+        border:SetPoint("BOTTOMRIGHT",b,"BOTTOMRIGHT",4,-4)
+        border:SetAlpha(0)
+        b.edgeGlow={border}
+        b.edgeOpacity=0.95
+        b:SetScript("OnClick",fn)
+        tooltipButton(b,textFn)
+        return b
+    end
+    local iconDirection=imageButton(views[3],12,ICONS.Deposit,function()
+        setDirection(transferDirection=="deposit" and "withdraw" or "deposit")
+    end,function()return (transferDirection=="deposit" and "Deposit" or "Withdraw").." is selected. Click to switch to "..(transferDirection=="deposit" and "Withdraw" or "Deposit")end)
+    separator(views[3],52,-18,28)
+    local iconCategories={}
+    for i,c in ipairs(categories) do
+        local key=c.key
+        iconCategories[#iconCategories+1]=imageButton(views[3],60+(i-1)*42,ICONS[key],
+            function()categoryAction(key)end,
+            function()return (transferDirection=="deposit" and "Deposit " or "Withdraw ")..tabLabels[key]end)
+    end
+    separator(views[3],270,-18,28)
+    local iconAll=imageButton(views[3],280,ICONS.All,actionAll,
+        function()return job and "Stop transfer" or (transferDirection=="deposit" and "Deposit All" or "Withdraw All")end)
+
+    local viewButton=S.Button(panel,">","secondary",23,function()
+        layoutMode=layoutMode%3+1
+        uiSettings().layout=layoutMode
+        refreshPanel()
+        savePanelPosition()
+    end)
+    viewButton:SetSize(23,21)
+    viewButton:SetPoint("TOPRIGHT",panel,"TOPRIGHT",-10,-10)
+    viewButton:SetFrameLevel(panel:GetFrameLevel()+10)
+    viewButton.tooltipText="Switch layout: Full / Compact / Icons"
+
+    -- Cached dimensions: direction toggles and transfers repaint without
+    -- allocating two throwaway tables on every refresh.
+    local widths={334,294,360}
+    local heights={217,89,65}
+    refreshPanel=function()
+        panel:SetSize(widths[layoutMode],heights[layoutMode])
+        for i,v in ipairs(views) do if i==layoutMode then v:Show() else v:Hide()end end
+        if job then fullStop:Enable() else fullStop:Disable() end
+        compactAll:SetText(job and "Stop" or "All")
+        local current=transferDirection=="deposit" and GREEN or AMBER
+        paintDirection(compactDeposit,transferDirection=="deposit",GREEN)
+        paintDirection(compactWithdraw,transferDirection=="withdraw",AMBER)
+        for _,b in ipairs(compactCategories) do paintDirection(b,true,current)end
+        paintDirection(compactAll,true,current)
+        iconDirection.art:SetTexture(ICONS[transferDirection=="deposit" and "Deposit" or "Withdraw"])
+        for _,b in ipairs(iconCategories) do
+            for _,tex in ipairs(b.edgeGlow) do
+                tex:SetVertexColor(current[1],current[2],current[3])
+                tex:SetAlpha(b.edgeOpacity)
+            end
+        end
+        -- Avoid creating a temporary table on every panel refresh.
+        for _,tex in ipairs(iconDirection.edgeGlow) do
+            tex:SetVertexColor(current[1],current[2],current[3])
+            tex:SetAlpha(iconDirection.edgeOpacity)
+        end
+        for _,tex in ipairs(iconAll.edgeGlow) do
+            tex:SetVertexColor(current[1],current[2],current[3])
+            tex:SetAlpha(iconAll.edgeOpacity)
+        end
+    end
+    refreshPanel()
     panel:Hide()
 end
 -- Register slash commands before attempting the optional settings UI.
@@ -1117,7 +1530,7 @@ addon:SetScript("OnEvent",function(self,event)
         -- API registration may become available after another addon finishes loading.
         registerConfigPanel()
     elseif event=="PLAYER_LOGIN" then
-        loadTabs();createPanel();registerConfigPanel()
+        loadTabs();createPanel();loadUiPreference();registerConfigPanel()
     elseif event=="GUILDBANKBAGSLOTS_CHANGED" then
         if job and job.mode=="guild" and job.phase=="waiting" and currentTab()==job.tab then
             job.tabUpdated=true
