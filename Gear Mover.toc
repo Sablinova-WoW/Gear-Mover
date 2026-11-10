@@ -1,0 +1,7 @@
+## Interface: 30300
+## Title: Gear Mover
+## Notes: Move equipment between bags and live guild or personal banks; configurable guild-tab sorting.
+## Author: Community contributors
+## Version: 1.0.0
+## SavedVariables: GearMoverDB
+GearMover.lua
