@@ -2,6 +2,8 @@
 ## Title: Gear Mover
 ## Notes: Move equipment between bags and live guild or personal banks; configurable guild-tab sorting.
 ## Author: Community contributors
-## Version: 1.0.0
+## Version: 1.1.4-beta
 ## SavedVariables: GearMoverDB
+UI\Style.lua
+UI\Skins\Classic\Skin.lua
 GearMover.lua

@@ -1,58 +1,65 @@
-Gear Mover v1.0.0 - Synastria / WoW 3.3.5a
-
-PURPOSE
-Transfer matching armor (Cloth, Leather, Mail, Plate) and main-hand,
-off-hand, shield, and ranged-slot equipment between bags and a live
-personal bank or the currently open guild bank.
-
-SETTINGS
-Open Interface > AddOns > Gear Mover or type /ggm.
-Assign guild-bank tabs 1–6 (or Unassigned) to each category. Assignments
-are saved per realm and guild. Individual guild deposits use an assigned
-tab, or the currently selected tab if Unassigned. Deposit All processes
-only assigned categories and changes tabs as needed.
-
-Optional filters: minimum deposit quality (0–5) and Skip Mythic.
-Both apply to deposits only, not withdrawals. Click Save settings.
-
-TRANSFER WINDOW
-It appears when you open a supported live bank. You can also toggle it
-with /ggm window. The bottom row contains Deposit All and Stop.
-Weapons withdrawn from a bank are filtered for current-character
-attunability; deposits are not filtered that way. Guild-bank deposits
-skip soulbound equipment. Personal-bank transfers preserve their previous
-behavior. All items are processed in matching equipment categories.
-
-PERFORMANCE / STATUS
-Transfers use the configured 10-200 ms interval (80 ms default).
-Source-slot observations are reconciled
-about every 200 ms while a batch runs (and once at completion), avoiding
-an inventory read on every rendered frame. Stack merging is conservative.
-Reported observations are NOT guaranteed server-confirmed transfers.
-
-COMMANDS
-/ggm             Open Interface > AddOns > Gear Mover
-/ggm window      Toggle floating transfer panel
-/ggm all         Deposit All into assigned guild tabs
-/ggm tabs        Display current tab assignments
-/ggm debug       Display bank-detection information
+Gear Mover v1.1.4 Beta — Synastria / World of Warcraft 3.3.5a
 
 INSTALL
-Copy the Gear Mover folder into Interface/AddOns and reload WoW.
-Keep one version installed at a time. Settings are in GearMoverDB.
+Copy the Gear Mover folder to Interface/AddOns, replacing older versions.
+Type /reload. Your existing GearMoverDB settings are retained.
 
-RELEASE VALIDATION
-Before public distribution, test bank detection, transfers, settings navigation,
-and guild tab switching in the live Synastria client. Transfer counts reflect
-attempts and observed source changes, not server acknowledgements.
-Start with inexpensive items.
+SETTINGS  (/ggm)
+For each category (Cloth, Leather, Mail, Plate, Weapons), check any of
+six guild tabs. Categories can share tabs. Click Save settings.
+Old single-tab selections are migrated automatically on load.
+Tab assignments and deposit filters are saved per guild and realm.
+Transfer speed (10–200 ms, default 80 ms) is shared across guilds.
+Below 50 ms is experimental; the client/server may reject rapid moves.
+The checkbox UI uses the bundled MaterialCraftUI Classic skin ONLY.
+No separate MaterialCraftUI installation is required.
 
-TRANSFER SPEED
-Configure 10-200 ms under Interface > AddOns > Gear Mover; the default
-is 80 ms. Intervals below 50 ms are experimental. This is an attempt
-interval, not a guarantee of server transfer speed or successful moves.
+TRANSFERS  (/ggm window)
+Individual Deposit: tries the selected tabs in ascending order. If none
+has room for a whole stack, it also tries the tab currently open when
+that tab is not already selected. With no selected tabs, it uses the
+currently open tab. The first selected tab is the primary destination. Additional selected
+tabs are visited only if the primary has no room for eligible stacks
+(or cannot be used). When no eligible items remain, the category stops
+without cycling through other selected tabs.
+Deposit All: visits selected tabs only for categories that still have
+transferable equipment. It skips categories with only soulbound or locked gear.
+It uses the first selected tab as primary and visits subsequent selected
+tabs only when eligible items cannot fit on the current tab.
+It never uses an unassigned tab as an automatic fallback.
+Withdraw (category): removes matching equipment from the open bank tab.
+The existing weapon-withdraw attunement filter remains unchanged.
+Withdraw All (guild bank only): scans the currently open tab first, then
+other accessible tabs 1–6, and removes
+only items currently attunable by the character, checking link-specific
+attunement progress before every attempt. It stops if bags fill or a
+bank/data error prevents safe continuation. No account-wide withdrawal.
+Guild deposits skip soulbound items. Regular bank deposit/withdraw
+behavior is preserved. Stacks merge only if the entire source stack fits.
+No automatic transfer can be guaranteed by client-side UI code: bank
+responses may lag; chat summaries distinguish attempted from observed.
+Multi-tab jobs wait for outstanding source changes before switching tabs.
+If the bank does not confirm a move within 3 seconds, the batch stops
+instead of risking a second attempt on the same source stack.
 
-THIRD-PARTY ATTRIBUTION
-Gear Mover was developed with reference to OmniInventory/OmniInv-Syn.
-See THIRD_PARTY_NOTICES.txt for the upstream MIT license notice.
-This notice does not assign a license to original Gear Mover code.
+COMMANDS
+/ggm              Open settings (scroll-aware WoW 3.3.5 navigation)
+/ggm window       Toggle floating transfer window
+/ggm all          Deposit All
+/ggm withdrawall  Withdraw All
+/ggm tabs         Print assigned tabs
+/ggm debug        Inspect live bank detection
+
+BETA TESTING
+Start at 80 ms with inexpensive items. Test two selected tabs, a full
+first tab, a manual deposit to an unassigned open tab, and Withdraw All
+with some eligible and ineligible items. Observe server response and
+check actual item counts; attempted transfers are not confirmations.
+This beta is not yet in-game verified on Synastria.
+If a guild-bank response remains unconfirmed, the batch stops after a
+3-second wait. Check the actual bag and bank contents before restarting.
+
+ATTRIBUTION
+MaterialCraftUI by iExpulsion (MIT); license included in
+MATERIALCRAFTUI_LICENSE.txt. Only Style.lua and the Classic skin are
+bundled. See THIRD_PARTY_NOTICES.txt for OmniInventory attribution.

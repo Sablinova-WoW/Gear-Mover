@@ -1,6 +1,8 @@
 -- Gear Mover for WoW 3.3.5a (Synastria)
 -- Independent of OmniInventory. Works with an open guild bank or personal bank.
 -- Transfer timing is configurable in Interface > AddOns (10-200 ms).
+local addonName, GearMoverNS = ...
+if GearMoverNS and GearMoverNS.Style then GearMoverNS.Style.UseSkin("classic") end
 local addon = CreateFrame("Frame", "GearMoverEventFrame")
 local panel
 local createPanel
@@ -13,8 +15,17 @@ local observations = {}
 local pendingObservations = {}
 local tabKeys = {"Cloth", "Leather", "Mail", "Plate", "Weapon"}
 local tabLabels = {Cloth="Cloth", Leather="Leather", Mail="Mail", Plate="Plate", Weapon="Weapons"}
-local function configuredTab(key)
-    return configuredTabs[key]
+local function configuredTabList(key)
+    return configuredTabs[key] or {}
+end
+local function selectedTabs(key)
+    local out = {}
+    for _, tab in ipairs(configuredTabList(key)) do
+        if tab >= 1 and tab <= (GetNumGuildBankTabs() or 0) then
+            out[#out+1] = tab
+        end
+    end
+    return out
 end
 local guildActive = false
 local personalActive = false
@@ -342,7 +353,8 @@ local function buildQueue(direction, key, mode, tab)
     elseif mode=="guild" then
         for slot=1,98 do
             local link=GetGuildBankItemLink(tab,slot)
-            if itemCategory(link)==key and (key~="Weapon" or isAttunableForCurrentCharacter(link)) then
+            if (key=="All" and isAttunableForCurrentCharacter(link)) or
+               (itemCategory(link)==key and (key~="Weapon" or isAttunableForCurrentCharacter(link))) then
                 table.insert(q,{slot=slot,link=link})
             end
         end
@@ -358,45 +370,81 @@ local function buildQueue(direction, key, mode, tab)
     end
     return q
 end
-local function start(direction,key)
-    if job then msg("A transfer is running. Click Stop before starting another.") return end
-    local mode = bankOpen() and "guild" or (personalBankOpen() and "personal" or nil)
-    if not mode then msg("No standard bank session detected. Use /ggm debug to inspect bank detection.") return end
-    if InCombatLockdown and InCombatLockdown() then msg("Cannot transfer in combat.") return end
-    if CursorHasItem and CursorHasItem() then msg("Clear your cursor before transferring.") return end
-    local tab
-    if mode=="guild" then
-        -- Deposits use a configured tab when present; withdrawals always use the
-        -- currently displayed tab, preserving previous withdrawal behavior.
-        tab=(direction=="deposit" and configuredTab(key)) or currentTab()
-        if not tab or tab < 1 or tab > (GetNumGuildBankTabs() or 0) then
-            msg("Configured tab is not available in this guild bank.") return
-        end
-        -- Permission and contents will be validated after any tab switch.
-        if direction=="withdraw" then
-            local _,_,viewable,_,_,remaining=GetGuildBankTabInfo(tab)
-            if not viewable then msg("You cannot view this guild tab.") return end
-            if remaining and remaining==0 then msg("Guild-tab withdrawal limit reached.") return end
+-- Multi-tab guild deposits are a sequence of tab visits. A full tab advances
+-- to the next selected destination; individual Deposit adds the OPEN tab as
+-- a last-resort destination if it was not selected. Deposit All never does.
+local function newJob(direction, mode, stages)
+    observations={confirmed=0}
+    pendingObservations={}
+    job={direction=direction,mode=mode,stages=stages,stage=1,
+         index=1,moved=0,skipped=0,reserved={},guildPlanned={},
+         phase="select",tabWait=0}
+end
+local function addDepositStages(stages,key,includeOpenTab)
+    local tabs=selectedTabs(key)
+    if includeOpenTab then
+        local open=currentTab()
+        local exists=false
+        for _, tab in ipairs(tabs) do if tab==open then exists=true end end
+        if open and not exists then tabs[#tabs+1]=open end
+    end
+    for _, tab in ipairs(tabs) do
+        stages[#stages+1]={category=key,tab=tab}
+    end
+end
+local function attunementReady()
+    return synastriaReady and type(_G.CanAttuneItemHelper)=="function" and
+           (type(_G.GetItemLinkAttuneProgress)=="function" or
+            type(_G.GetItemAttuneProgress)=="function")
+end
+local function hasDepositableItems(key)
+    for bag=0,4 do
+        for slot=1,(GetContainerNumSlots(bag) or 0) do
+            local link=GetContainerItemLink(bag,slot)
+            if link and itemCategory(link)==key and allowedDeposit(link) then
+                local _,_,locked=GetContainerItemInfo(bag,slot)
+                if not locked and not isSoulbound(bag,slot) then return true end
+            end
         end
     end
-    if direction=="withdraw" and key=="Weapon" then
-        if not synastriaReady or type(_G.CanAttuneItemHelper)~="function" or
-           (type(_G.GetItemLinkAttuneProgress)~="function" and type(_G.GetItemAttuneProgress)~="function") then
-            msg("Attunement APIs unavailable; no weapons withdrawn.") return
+    return false
+end
+
+local function start(direction,key)
+    if job then msg("A transfer is running. Click Stop before starting another.") return end
+    local mode=bankOpen() and "guild" or (personalBankOpen() and "personal" or nil)
+    if not mode then msg("No live bank session detected. Use /ggm debug if needed.") return end
+    if InCombatLockdown and InCombatLockdown() then msg("Cannot transfer in combat.") return end
+    if CursorHasItem and CursorHasItem() then msg("Clear your cursor first.") return end
+    if direction=="withdraw" and key=="Weapon" and not attunementReady() then
+        msg("Attunement APIs unavailable; no weapons withdrawn.") return
+    end
+    if mode=="guild" and direction=="deposit" then
+        if not hasDepositableItems(key) then msg("No transferable items to deposit.") return end
+        local stages={}
+        addDepositStages(stages,key,true)
+        if #stages==0 then msg("No available guild bank tab.") return end
+        newJob(direction,mode,stages)
+        msg("Depositing "..tabLabels[key].." through up to "..#stages.." tabs.")
+        return
+    end
+    local tab=mode=="guild" and currentTab() or nil
+    if mode=="guild" then
+        if not tab then msg("Select an available guild bank tab.") return end
+        local _,_,viewable,_,_,remaining=GetGuildBankTabInfo(tab)
+        if not viewable or (direction=="withdraw" and remaining==0) then
+            msg("No access or withdrawal allowance on this tab.") return
         end
     end
     local queue=buildQueue(direction,key,mode,tab)
-    if #queue==0 then msg("No matching "..key.." items found (attunable only for weapon withdrawals).") return end
-    observations={confirmed=0}
-    pendingObservations={}
-    job={direction=direction,category=key,mode=mode,tab=tab,queue=queue,index=1,moved=0,skipped=0,reserved={},guildPlanned={},
-         phase=(mode=="guild" and direction=="deposit") and "select" or "transfer",tabWait=0}
-    msg(string.format("Starting %s: %d %s stacks (%s%s).",direction,#queue,key,mode,tab and (" tab "..tab) or ""))
+    if #queue==0 then msg("No matching items found.") return end
+    observations={confirmed=0};pendingObservations={}
+    job={direction=direction,category=key,mode=mode,tab=tab,queue=queue,
+         index=1,moved=0,skipped=0,reserved={},guildPlanned={},phase="transfer",tabWait=0}
+    msg(string.format("Starting %s: %d %s stacks.",direction,#queue,tabLabels[key]))
 end
 
 
--- Deposit each category into its assigned guild tab, retaining the existing
--- single-category and withdraw buttons.
 local function startAll()
     if job then msg("Stop the active transfer first.") return end
     if not guildBankOpen() then msg("Open your live guild bank first.") return end
@@ -404,30 +452,93 @@ local function startAll()
     if CursorHasItem and CursorHasItem() then msg("Clear your cursor first.") return end
     local stages={}
     for _,key in ipairs(tabKeys) do
-        local tab=configuredTab(key)
-        if tab and tab>=1 and tab<=(GetNumGuildBankTabs() or 0) then
-            local q=buildQueue("deposit",key,"guild",tab)
-            if #q>0 then table.insert(stages,{category=key,tab=tab,queue=q}) end
+        if hasDepositableItems(key) then
+            addDepositStages(stages,key,false)
         end
     end
-    if #stages==0 then msg("No configured guild tabs with items to deposit. Configure them in Interface > AddOns > Gear Mover.") return end
-    observations={confirmed=0}
-    pendingObservations={}
-    job={direction="deposit",mode="guild",all=true,stages=stages,stage=1,
-         index=1,moved=0,skipped=0,reserved={},guildPlanned={},phase="select",tabWait=0}
-    msg("Deposit All: processing "..#stages.." categories.")
+    if #stages==0 then msg("No matching items with assigned guild tabs.") return end
+    newJob("deposit","guild",stages)
+    msg("Deposit All: "..#stages.." tab visits queued.")
 end
+
+local function startWithdrawAll()
+    if job then msg("Stop the active transfer first.") return end
+    if not guildBankOpen() then msg("Open your live guild bank first.") return end
+    if InCombatLockdown and InCombatLockdown() then msg("Cannot transfer in combat.") return end
+    if CursorHasItem and CursorHasItem() then msg("Clear your cursor first.") return end
+    if not attunementReady() then msg("Attunement APIs unavailable; nothing withdrawn.") return end
+    -- Withdraw All cannot use partial-stack capacity safely without relying
+    -- on AutoStore's undocumented merge behavior. Avoid touring six tabs when
+    -- every carried bag slot is already occupied.
+    if not freeBagSlot() then msg("No empty bag slots; Withdraw All not started.") return end
+    local stages={}
+    local first=currentTab()
+    if first and first<=6 then stages[#stages+1]={category="All",tab=first} end
+    for tab=1,math.min(6,GetNumGuildBankTabs() or 0) do
+        if tab~=first then stages[#stages+1]={category="All",tab=tab} end
+    end
+    if #stages==0 then msg("No guild tabs available.") return end
+    newJob("withdraw","guild",stages)
+    msg("Withdraw All: scanning "..#stages.." guild tabs for current-character attunables.")
+end
+
 local function loadStage(j)
-    local stage=j.stages[j.stage]
+    local stage=j.stages and j.stages[j.stage]
     if not stage then return false end
-    j.category=stage.category;j.tab=stage.tab;j.queue=stage.queue
-    j.index=1;j.reserved={};j.guildPlanned={};j.tabWait=0;j.phase="select"
+    j.category=stage.category
+    j.tab=stage.tab
+    j.queue=nil -- Build only once this tab's live data is ready.
+    j.index=1
+    j.reserved={}
+    j.guildPlanned={}
+    j.tabWait=0
+    j.overflowBlocked=false
+    j.phase="select"
     return true
 end
-local function advanceStage(j)
-    if not j.all then stop("Transfer complete") return end
+-- A completed tab queue is not evidence that the tab is full. Only an
+-- actual lack of destination space (or inaccessible tab) permits overflow
+-- to another tab of the same category. This keeps the first selected tab
+-- as the primary destination and avoids unnecessary guild-bank queries.
+
+local function finishStage(j,overflow)
+    if not j.stages then stop("Transfer complete") return end
+    local previousCategory=j.category
     j.stage=j.stage+1
-    if not loadStage(j) then stop("Deposit All complete") end
+    if j.direction=="deposit" then
+        -- Once a category's items have all been attempted, do not visit its
+        -- other assigned tabs. Even on overflow, skip them if no eligible
+        -- items remain after outstanding moves have been confirmed.
+        if not overflow or not hasDepositableItems(previousCategory) then
+            while j.stages[j.stage] and j.stages[j.stage].category==previousCategory do
+                j.stage=j.stage+1
+            end
+        end
+        -- A category might have no transferable items by the time we reach it
+        -- (e.g. only soulbound or locked gear). Skip its tabs entirely.
+        while j.stages[j.stage] and not hasDepositableItems(j.stages[j.stage].category) do
+            local emptyCategory=j.stages[j.stage].category
+            repeat
+                j.stage=j.stage+1
+            until not j.stages[j.stage] or j.stages[j.stage].category~=emptyCategory
+        end
+    end
+    j.advanceOverflow=nil
+    if not loadStage(j) then
+        stop(j.direction=="withdraw" and "Withdraw All complete" or "Deposit complete")
+    end
+end
+local function advanceStage(j,overflow)
+    -- Source slots can update asynchronously after a guild bank operation.
+    -- Never make an overflow decision based on stale bag contents.
+    reconcileObservations()
+    if #pendingObservations > 0 then
+        j.phase="settling"
+        j.settleElapsed=0
+        j.advanceOverflow=overflow==true
+    else
+        finishStage(j,overflow==true)
+    end
 end
 
 addon:SetScript("OnUpdate",function(self,elapsed)
@@ -460,49 +571,63 @@ addon:SetScript("OnUpdate",function(self,elapsed)
     tick=0
     if job.mode=="guild" then
         if not bankOpen() then stop("Guild bank closed") return end
-        if job.all and not job.category then loadStage(job) end
+        if job.stages and not job.category then loadStage(job) end
+        if job.phase=="settling" then
+            reconcileObservations()
+            if #pendingObservations==0 then
+                finishStage(job,job.advanceOverflow)
+            else
+                job.settleElapsed=(job.settleElapsed or 0)+interval
+                if job.settleElapsed>=3 then
+                    stop("Guild bank response unconfirmed; stopped to avoid retrying an unchanged item")
+                end
+            end
+            return
+        end
         if job.phase=="select" then
-            local _,_,viewable,canDeposit=GetGuildBankTabInfo(job.tab)
-            if not viewable or not canDeposit then
-                msg("Skipping "..tabLabels[job.category].." (tab "..job.tab..": no access).")
-                advanceStage(job)
+            local _,_,viewable,canDeposit,_,remaining=GetGuildBankTabInfo(job.tab)
+            if not viewable or (job.direction=="deposit" and not canDeposit) or
+               (job.direction=="withdraw" and remaining==0) then
+                msg("Skipping tab "..job.tab.." (no permission or withdrawals remaining).")
+                advanceStage(job,true)
                 return
             end
-            if currentTab()~=job.tab then
-                if type(SetCurrentGuildBankTab)~="function" then stop("Guild tab switch API unavailable") return end
-                job.tabWasChanged=true
-                job.tabUpdated=false
-                SetCurrentGuildBankTab(job.tab)
-            else
-                job.tabWasChanged=false
-                job.tabUpdated=true
+            local switching=currentTab()~=job.tab
+            if switching and type(SetCurrentGuildBankTab)~="function" then
+                stop("Guild tab switch API unavailable") return
             end
+            job.tabWasChanged=switching
+            job.tabUpdated=not switching
+            -- Register the wait state BEFORE requesting a tab. A fast/synchronous
+            -- GUILDBANKBAGSLOTS_CHANGED must not be lost between the request
+            -- and changing phase (which previously caused spurious timeouts).
+            job.phase="waiting";job.tabWait=0
+            if switching then SetCurrentGuildBankTab(job.tab) end
             if type(QueryGuildBankTab)=="function" then QueryGuildBankTab(job.tab) end
-            job.phase="waiting"
-            job.tabWait=0
             return
         elseif job.phase=="waiting" then
             job.tabWait=job.tabWait+interval
-            -- Wait for the tab to become active and for a guild-bank update.
-            -- A short settle window helps avoid acting on the prior tab's contents.
             if currentTab()~=job.tab then
-                if job.tabWait>3 then stop("Guild bank tab switch timed out") end
+                if job.tabWait>3 then stop("Guild tab switch timed out") end
                 return
             end
             if job.tabWait<0.45 then return end
-            -- After switching tabs, require fresh slot data before depositing.
-            -- Never use previous-tab data if a server reply is delayed.
             if job.tabWasChanged and not job.tabUpdated then
-                if job.tabWait>4 then stop("Guild bank tab data timed out; no further items moved") end
+                if job.tabWait>4 then stop("Guild tab data timed out; no further items moved") end
                 return
             end
+            if job.stages then
+                job.queue=buildQueue(job.direction,job.category,"guild",job.tab)
+                job.index=1
+                if #job.queue==0 then advanceStage(job,false) return end
+            end
             job.phase="transfer"
-        elseif currentTab()~=job.tab then stop("Guild bank tab changed during transfer") return end
+        elseif currentTab()~=job.tab then stop("Guild tab changed during transfer") return end
     elseif not personalBankOpen() then stop("Regular bank closed") return end
     if InCombatLockdown and InCombatLockdown() then stop("Transfer stopped: combat") return end
     if CursorHasItem and CursorHasItem() then stop("Transfer stopped: item on cursor") return end
     local entry=job.queue[job.index]
-    if not entry then advanceStage(job) return end
+    if not entry then advanceStage(job,job.overflowBlocked==true) return end
     job.index=job.index+1
     if job.mode=="personal" then
         local sourceBag,sourceSlot=entry.bag,entry.slot
@@ -548,35 +673,54 @@ addon:SetScript("OnUpdate",function(self,elapsed)
                 local merging=dest~=nil
                 if not dest then dest=freeGuildSlot(tab,job.reserved) end
                 if not dest then
-                    if job.all then msg("Tab "..tab.." is full; skipping remaining "..tabLabels[job.category]..".");advanceStage(job)
-                    else stop("No empty guild-bank slots") end
-                    return
-                end
-                PickupContainerItem(entry.bag,entry.slot)
-                if CursorHasItem and CursorHasItem() then
-                    PickupGuildBankItem(tab,dest)
-                    if CursorHasItem and CursorHasItem() then
-                        PickupContainerItem(entry.bag,entry.slot)
-                        if CursorHasItem and CursorHasItem() then stop("Could not restore item; clear cursor") return end
-                        job.skipped=job.skipped+1
+                    if job.stages then
+                        -- One oversized stack does not mean the tab is full:
+                        -- later smaller stacks may still fit. Inspect the
+                        -- remaining queue before considering overflow.
+                        job.overflowBlocked=true
                     else
-                        if not merging then job.reserved[dest]=true
-                        else job.guildPlanned[dest]=(job.guildPlanned[dest] or 0)+count end
-                        job.moved=job.moved+1
-                        observeLater({sourceType="container",bag=entry.bag,slot=entry.slot,link=link,count=count})
+                        stop("No empty guild-bank slots")
+                        return
                     end
-                else job.skipped=job.skipped+1 end
+                else
+                    PickupContainerItem(entry.bag,entry.slot)
+                    if CursorHasItem and CursorHasItem() then
+                        PickupGuildBankItem(tab,dest)
+                        if CursorHasItem and CursorHasItem() then
+                            PickupContainerItem(entry.bag,entry.slot)
+                            if CursorHasItem and CursorHasItem() then
+                                stop("Could not restore item; clear cursor")
+                                return
+                            end
+                            job.skipped=job.skipped+1
+                        else
+                            if not merging then
+                                job.reserved[dest]=true
+                            else
+                                job.guildPlanned[dest]=(job.guildPlanned[dest] or 0)+count
+                            end
+                            job.moved=job.moved+1
+                            observeLater({sourceType="container",bag=entry.bag,slot=entry.slot,link=link,count=count})
+                        end
+                    else
+                        job.skipped=job.skipped+1
+                    end
+                end
             end
         else job.skipped=job.skipped+1 end
     else
         local tab=job.tab
         local link=GetGuildBankItemLink(tab,entry.slot)
-        if link and itemCategory(link)==job.category and link==entry.link then
-            if job.category=="Weapon" and not isAttunableForCurrentCharacter(link) then job.skipped=job.skipped+1
+        if link and (job.category=="All" or itemCategory(link)==job.category) and link==entry.link then
+            if (job.category=="All" or job.category=="Weapon") and
+               not isAttunableForCurrentCharacter(link) then job.skipped=job.skipped+1
             else
                 if not freeBagSlot() then stop("No completely empty bag slot") return end
                 local _,_,_,_,_,remaining=GetGuildBankTabInfo(tab)
-                if remaining and remaining==0 then stop("Guild-tab withdrawal limit reached") return end
+                if remaining and remaining==0 then
+                    if job.stages then advanceStage(job,true) else stop("Guild-tab withdrawal limit reached") end
+                    return
+                end
                 local before=guildCount(tab,entry.slot)
                 AutoStoreGuildBankItem(tab,entry.slot)
                 job.moved=job.moved+1
@@ -584,7 +728,7 @@ addon:SetScript("OnUpdate",function(self,elapsed)
             end
         else job.skipped=job.skipped+1 end
     end
-    if job.index>#job.queue then advanceStage(job) end
+    if job.index>#job.queue then advanceStage(job,job.overflowBlocked==true) end
 end)
 
 local function makeButton(parent,label,x,y,width,handler)
@@ -605,7 +749,11 @@ local function saveTabs()
     if not GearMoverDB then GearMoverDB={guilds={}} end
     if not GearMoverDB.guilds then GearMoverDB.guilds={} end
     local stored={}
-    for _,key in ipairs(tabKeys) do stored[key]=configuredTabs[key] end
+    for _,key in ipairs(tabKeys) do
+        local copy={}
+        for _,tab in ipairs(configuredTabList(key)) do copy[#copy+1]=tab end
+        stored[key]=copy
+    end
     stored.minDepositQuality=minDepositQuality
     stored.skipMythic=skipMythic
     -- Speed is a global player preference; all guilds and personal banks use it.
@@ -624,7 +772,29 @@ local function loadTabs()
     if minDepositQuality<0 or minDepositQuality>5 then minDepositQuality=0 end
     skipMythic=stored.skipMythic==true
     for _,key in ipairs(tabKeys) do
-        local v=tonumber(stored[key]);if v and v>=1 and v<=6 then configuredTabs[key]=math.floor(v) end
+        local value=stored[key]
+        local list={}
+        if type(value)=="table" then
+            for tab=1,6 do
+                if value[tab]==true then list[#list+1]=tab end
+            end
+            -- Also accept the new compact ordered-list format.
+            if #list==0 then
+                for _,v in ipairs(value) do
+                    v=tonumber(v)
+                    if v and v>=1 and v<=6 then
+                        local exists=false
+                        for _,old in ipairs(list) do if old==v then exists=true end end
+                        if not exists then list[#list+1]=math.floor(v) end
+                    end
+                end
+                table.sort(list)
+            end
+        else
+            local v=tonumber(value)
+            if v and v>=1 and v<=6 then list[1]=math.floor(v) end
+        end
+        configuredTabs[key]=list
     end
 end
 -- Native WotLK Interface > AddOns settings. Values are edited locally and
@@ -722,50 +892,44 @@ local function createConfigPanel()
         end
     end
 
+    -- Each category may use more than one destination tab. Classic-skinned
+    -- MaterialCraftUI checkboxes are bundled; no external UI addon required.
+    local style = GearMoverNS and GearMoverNS.Style
     local tabInputs={}
     local pendingTabs={}
+    for tab=1,6 do
+        local head=configPanel:CreateFontString(nil,"ARTWORK","GameFontNormalSmall")
+        head:SetPoint("TOPLEFT",174+(tab-1)*54,-72)
+        head:SetText("Tab "..tab)
+    end
     for i,key in ipairs(tabKeys) do
         local categoryKey=key
-        local rowY=-82-(i-1)*29
+        local rowY=-96-(i-1)*26
         local label=configPanel:CreateFontString(nil,"ARTWORK","GameFontHighlight")
-        label:SetPoint("TOPLEFT",30,rowY-7)
+        label:SetPoint("TOPLEFT",30,rowY-3)
         label:SetText(tabLabels[key])
-        local menu=CreateFrame("Frame","GearMoverTabDropdown"..key,configPanel,"UIDropDownMenuTemplate")
-        menu:SetPoint("TOPLEFT",115,rowY)
-        UIDropDownMenu_SetWidth(menu,92)
-        UIDropDownMenu_Initialize(menu,function(self,level)
-            local function addOption(n,display)
-                local value=n -- Lua 5.1 callback must capture this option's value.
-                local info=UIDropDownMenu_CreateInfo()
-                info.text=display
-                info.value=value or 0
-                info.checked=(pendingTabs[categoryKey]==value)
-                info.func=function()
-                    pendingTabs[categoryKey]=value
-                    UIDropDownMenu_SetSelectedValue(menu,value or 0)
-                    UIDropDownMenu_SetText(menu,display)
-                end
-                UIDropDownMenu_AddButton(info,level)
-            end
-            addOption(nil,"Unassigned")
-            for n=1,6 do addOption(n,"Tab "..n) end
-        end)
-        tabInputs[categoryKey]=menu
-        attachDropdownHelp(menu, tabLabels[categoryKey] .. " tab", {
-            "Deposit " .. tabLabels[categoryKey] .. " uses this tab.",
-            "Deposit All skips it if Unassigned.",
-            "Withdraw uses the open tab."
-        })
+        tabInputs[key]={}
+        pendingTabs[key]={}
+        for tab=1,6 do
+            local tabNumber=tab
+            local box=style.Check(configPanel,20,function(self)
+                self:SetChecked(not self.on)
+                pendingTabs[categoryKey][tabNumber]=self.on
+            end)
+            box:SetPoint("TOPLEFT",178+(tab-1)*54,rowY+3)
+            box.tooltipText="Deposit "..tabLabels[categoryKey].." into tab "..tabNumber
+            tabInputs[categoryKey][tabNumber]=box
+        end
     end
 
     local rulesHeading=configPanel:CreateFontString(nil,"ARTWORK","GameFontNormal")
-    rulesHeading:SetPoint("TOPLEFT",22,-228)
+    rulesHeading:SetPoint("TOPLEFT",22,-226)
     rulesHeading:SetText("Deposit rules")
     local qualityLabel=configPanel:CreateFontString(nil,"ARTWORK","GameFontHighlight")
-    qualityLabel:SetPoint("TOPLEFT",30,-259)
+    qualityLabel:SetPoint("TOPLEFT",30,-256)
     qualityLabel:SetText("Minimum item quality")
     local qualityMenu=CreateFrame("Frame","GearMoverQualityDropdown",configPanel,"UIDropDownMenuTemplate")
-    qualityMenu:SetPoint("TOPLEFT",115,-251)
+    qualityMenu:SetPoint("TOPLEFT",115,-248)
     UIDropDownMenu_SetWidth(qualityMenu,116)
     local qualityNames={[0]="Any quality (0)",[1]="Common (1)",[2]="Uncommon (2)",[3]="Rare (3)",[4]="Epic (4)",[5]="Legendary (5)"}
     local pendingQuality=0
@@ -794,7 +958,7 @@ local function createConfigPanel()
         "Applies to deposits only."
     })
     local mythicBox=CreateFrame("CheckButton",nil,configPanel,"UICheckButtonTemplate")
-    mythicBox:SetPoint("TOPLEFT",278,-252)
+    mythicBox:SetPoint("TOPLEFT",278,-249)
     local mythicText=configPanel:CreateFontString(nil,"ARTWORK","GameFontHighlight")
     mythicText:SetPoint("LEFT",mythicBox,"RIGHT",4,0)
     mythicText:SetText("Skip Mythic on deposit")
@@ -805,13 +969,13 @@ local function createConfigPanel()
     })
 
     local speedLabel=configPanel:CreateFontString(nil,"ARTWORK","GameFontNormal")
-    speedLabel:SetPoint("TOPLEFT",30,-316)
+    speedLabel:SetPoint("TOPLEFT",30,-312)
     speedLabel:SetText("Transfer interval")
     local speedValue=configPanel:CreateFontString(nil,"ARTWORK","GameFontHighlight")
     speedValue:SetPoint("LEFT",speedLabel,"RIGHT",12,0)
     local speedSlider=CreateFrame("Slider","GearMoverTransferSpeedSlider",configPanel,"OptionsSliderTemplate")
     speedSlider:SetWidth(240)
-    speedSlider:SetPoint("TOPLEFT",45,-342)
+    speedSlider:SetPoint("TOPLEFT",45,-339)
     speedSlider:SetMinMaxValues(10,200)
     speedSlider:SetValueStep(1)
     _G[speedSlider:GetName().."Low"]:SetText("10 ms")
@@ -828,7 +992,7 @@ local function createConfigPanel()
         "10-49 ms is experimental. Server safety limits are not documented."
     })
     local speedWarning=configPanel:CreateFontString(nil,"ARTWORK","GameFontNormalSmall")
-    speedWarning:SetPoint("TOPLEFT",30,-375)
+    speedWarning:SetPoint("TOPLEFT",30,-371)
     speedWarning:SetTextColor(1,0.25,0.25)
     speedWarning:SetText("WARNING: Below 50 ms may cause instability.")
 
@@ -838,7 +1002,13 @@ local function createConfigPanel()
             return
         end
         configuredTabs={}
-        for _,key in ipairs(tabKeys) do configuredTabs[key]=pendingTabs[key] end
+        for _,key in ipairs(tabKeys) do
+            local chosen={}
+            for tab=1,6 do
+                if pendingTabs[key][tab] then chosen[#chosen+1]=tab end
+            end
+            configuredTabs[key]=chosen
+        end
         minDepositQuality=pendingQuality
         skipMythic=mythicBox:GetChecked() and true or false
         transferMs=pendingMs
@@ -861,10 +1031,14 @@ local function createConfigPanel()
 
     configPanel:SetScript("OnShow",function()
         for _,key in ipairs(tabKeys) do
-            local value=configuredTabs[key]
-            pendingTabs[key]=value
-            UIDropDownMenu_SetSelectedValue(tabInputs[key],value or 0)
-            UIDropDownMenu_SetText(tabInputs[key],value and ("Tab "..value) or "Unassigned")
+            local selected={}
+            for _,tab in ipairs(configuredTabList(key)) do selected[tab]=true end
+            pendingTabs[key]={}
+            for tab=1,6 do
+                local on=selected[tab] or false
+                pendingTabs[key][tab]=on
+                tabInputs[key][tab]:SetChecked(on)
+            end
         end
         pendingQuality=minDepositQuality
         UIDropDownMenu_SetSelectedValue(qualityMenu,pendingQuality)
@@ -905,7 +1079,7 @@ end
 createPanel = function()
     if panel then return end
     panel=CreateFrame("Frame","GearMoverPanel",UIParent)
-    panel:SetWidth(250); panel:SetHeight(198)
+    panel:SetWidth(332); panel:SetHeight(205)
     panel:SetPoint("CENTER",UIParent,"CENTER",285,0)
     panel:SetFrameStrata("DIALOG")
     panel:SetMovable(true); panel:EnableMouse(true)
@@ -920,12 +1094,13 @@ createPanel = function()
         local label=panel:CreateFontString(nil,"OVERLAY","GameFontNormal")
         label:SetWidth(52);label:SetJustifyH("LEFT")
         label:SetPoint("TOPLEFT",panel,"TOPLEFT",17,y-5);label:SetText(c.label)
-        makeButton(panel,"Deposit",70,y,76,function()start("deposit",c.key)end)
-        makeButton(panel,"Withdraw",153,y,79,function()start("withdraw",c.key)end)
+        makeButton(panel,"Deposit",78,y,104,function()start("deposit",c.key)end)
+        makeButton(panel,"Withdraw",189,y,112,function()start("withdraw",c.key)end)
     end
     -- Progress and completion are still reported in chat; no idle 'Ready' label.
-    makeButton(panel,"Deposit All",22,-162,119,function()startAll()end)
-    makeButton(panel,"Stop",148,-162,80,function()stop("Stopped by user")end)
+    makeButton(panel,"Deposit All",15,-167,99,function()startAll()end)
+    makeButton(panel,"Withdraw All",118,-167,112,function()startWithdrawAll()end)
+    makeButton(panel,"Stop",235,-167,79,function()stop("Stopped by user")end)
     panel:Hide()
 end
 -- Register slash commands before attempting the optional settings UI.
@@ -966,10 +1141,11 @@ SLASH_GEARMOVER2="/gearmover"
 SlashCmdList.GEARMOVER=function(input)
     input = (input or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
     if input=="tabs" then
-        for _,key in ipairs(tabKeys) do msg(tabLabels[key].." -> "..tostring(configuredTab(key) or "unassigned")) end
+        for _,key in ipairs(tabKeys) do msg(tabLabels[key].." -> "..(#configuredTabList(key)>0 and table.concat(configuredTabList(key),",") or "unassigned")) end
         return
     end
     if input=="all" then startAll() return end
+    if input=="withdrawall" then startWithdrawAll() return end
     if input=="" or input=="setup" or input=="options" then openConfigPanel() return end
     if input=="debug" then
         local shown = BankFrame and BankFrame:IsShown()
@@ -997,7 +1173,7 @@ SlashCmdList.GEARMOVER=function(input)
         if panel:IsShown() then panel:Hide() else panel:Show() end
         return
     end
-    msg("Commands: /ggm (settings), /ggm window, /ggm all, /ggm tabs, /ggm debug")
+    msg("Commands: /ggm (settings), /ggm window, /ggm all, /ggm withdrawall, /ggm tabs, /ggm debug")
 end
 
 -- Safe to attempt now that all slash commands have been registered.
