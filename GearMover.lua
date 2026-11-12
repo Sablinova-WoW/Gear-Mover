@@ -16,6 +16,7 @@ local configRegistered = false
 local configuredTabs = {}
 local minDepositQuality = 0
 local skipMythic = false
+local keepAttunable = false -- deposit rule: keep gear this character can still attune
 local observations = {}
 local pendingObservations = {}
 local tabKeys = {"Cloth", "Leather", "Mail", "Plate", "Weapon"}
@@ -35,6 +36,7 @@ end
 local guildActive = false
 local personalActive = false
 local job
+local startWatcher -- defined with the OnUpdate handler; every job start calls it
 local transferMs = 80 -- User-configured delay between attempts; 10-200 ms.
 local interval = transferMs / 1000
 local tick = 0
@@ -196,11 +198,16 @@ local function itemCategory(link)
     end
 end
 
+local attunableState -- defined below; true / false / nil (unknown)
 -- Optional deposit restrictions. Defaults preserve all previous matching equipment.
 local function allowedDeposit(link, bag, slot)
     if not link then return false end
     local _, _, quality = GetItemInfo(link)
     if minDepositQuality > 0 and (not quality or quality < minDepositQuality) then return false end
+    -- Keep gear the current character can still attune. Unknown (APIs not
+    -- ready, unresolved variant) is kept too: like the BoE protection, an
+    -- uncertain answer must not cause an unwanted deposit.
+    if keepAttunable and attunableState(link) ~= false then return false end
     if skipCompletedBoE or skipAccountAttunedBoE then
         local boe=originalBoE(link,bag,slot)
         if boe==true then
@@ -229,12 +236,15 @@ end
 -- Replicates the strict CURRENT-character Attunable category from
 -- OmniInv-Syn's Omni/Categorizer.lua (not account-wide attunability).
 -- Use link-based progress first so affix/forge variants resolve correctly.
-local function isAttunableForCurrentCharacter(link)
-    if not link or not synastriaReady or type(_G.CanAttuneItemHelper) ~= "function" then return false end
+-- Three answers: true = attunable now, false = definitely not (the character
+-- can't attune it, or progress is already 100), nil = can't tell.
+attunableState = function(link)
+    if not link or not synastriaReady or type(_G.CanAttuneItemHelper) ~= "function" then return nil end
     local itemID = tonumber(string.match(link, "item:(%d+)"))
-    if not itemID then return false end
+    if not itemID then return nil end
     local ok, canAttune = pcall(CanAttuneItemHelper, itemID)
-    if not ok or type(canAttune) ~= "number" or canAttune < 1 then return false end
+    if not ok or type(canAttune) ~= "number" then return nil end
+    if canAttune < 1 then return false end
 
     -- Current-character eligibility is authoritative here. Account-wide eligibility
     -- is not an additional requirement and may report differently on custom variants.
@@ -260,8 +270,13 @@ local function isAttunableForCurrentCharacter(link)
             end
         end
     end
-    -- Unknown progress is NOT safe to treat as attunable.
-    return type(progress) == "number" and progress < 100
+    if type(progress) ~= "number" then return nil end
+    return progress < 100
+end
+-- Withdrawals: unknown progress is NOT safe to treat as attunable.
+-- (Same results as before attunableState existed.)
+local function isAttunableForCurrentCharacter(link)
+    return attunableState(link) == true
 end
 local function currentTab()
     local n = GetCurrentGuildBankTab and GetCurrentGuildBankTab()
@@ -437,23 +452,32 @@ local function buildQueue(direction, key, mode, tab)
         for bag=0,4 do
             for slot=1,(GetContainerNumSlots(bag) or 0) do
                 local link=GetContainerItemLink(bag,slot)
-                if itemCategory(link)==key and allowedDeposit(link,bag,slot) then table.insert(q,{bag=bag,slot=slot,link=link}) end
+                local category=itemCategory(link)
+                if category and (key=="All" or category==key) and allowedDeposit(link,bag,slot) then
+                    table.insert(q,{bag=bag,slot=slot,link=link,category=category})
+                end
             end
         end
     elseif mode=="guild" then
         for slot=1,98 do
             local link=GetGuildBankItemLink(tab,slot)
-            if (key=="All" and isAttunableForCurrentCharacter(link)) or
-               (itemCategory(link)==key and (key~="Weapon" or isAttunableForCurrentCharacter(link))) then
-                table.insert(q,{slot=slot,link=link})
+            local category=itemCategory(link)
+            -- Match the personal-bank All filter: attunement eligibility alone
+            -- does not establish that an item belongs to a supported gear category.
+            if category and ((key=="All" and isAttunableForCurrentCharacter(link)) or
+               (category==key and (key~="Weapon" or isAttunableForCurrentCharacter(link)))) then
+                local _,_,locked=GetGuildBankItemInfo(tab,slot)
+                if not locked then q[#q+1]={slot=slot,link=link} end
             end
         end
     else
         for _,bag in ipairs(bankContainers()) do
             for slot=1,(bag==-1 and 28 or (GetContainerNumSlots(bag) or 0)) do
                 local link=GetContainerItemLink(bag,slot)
-                if itemCategory(link)==key and (key~="Weapon" or isAttunableForCurrentCharacter(link)) then
-                    table.insert(q,{bag=bag,slot=slot,link=link})
+                local category=itemCategory(link)
+                if category and (key=="All" or category==key) and
+                   (key~="All" and key~="Weapon" or isAttunableForCurrentCharacter(link)) then
+                    table.insert(q,{bag=bag,slot=slot,link=link,category=category})
                 end
             end
         end
@@ -469,6 +493,7 @@ local function newJob(direction, mode, stages)
     job={direction=direction,mode=mode,stages=stages,stage=1,
          index=1,moved=0,skipped=0,reserved={},guildPlanned={},
          phase="select",tabWait=0}
+    startWatcher()
     if refreshPanel then refreshPanel() end
 end
 local function addDepositStages(stages,key,includeOpenTab)
@@ -505,7 +530,9 @@ local function start(direction,key)
     if job then msg("A transfer is running. Click Stop before starting another.") return end
     local mode=bankOpen() and "guild" or (personalBankOpen() and "personal" or nil)
     if not mode then msg("No live bank session detected. Use /ggm debug if needed.") return end
-    if InCombatLockdown and InCombatLockdown() then msg("Cannot transfer in combat.") return end
+    -- No blanket InCombatLockdown gate here: Jeeves can provide a live bank
+    -- during combat on Synastria. Protected pickup failures are caught at
+    -- the item API call; this does not override client combat restrictions.
     if CursorHasItem and CursorHasItem() then msg("Clear your cursor first.") return end
     if direction=="withdraw" and key=="Weapon" and not attunementReady() then
         msg("Attunement APIs unavailable; no weapons withdrawn.") return
@@ -532,6 +559,7 @@ local function start(direction,key)
     observations={confirmed=0};pendingObservations={}
     job={direction=direction,category=key,mode=mode,tab=tab,queue=queue,
          index=1,moved=0,skipped=0,reserved={},guildPlanned={},phase="transfer",tabWait=0}
+    startWatcher()
     if refreshPanel then refreshPanel() end
     msg(string.format("Starting %s: %d %s stacks.",direction,#queue,tabLabels[key]))
 end
@@ -539,9 +567,20 @@ end
 
 local function startAll()
     if job then msg("Stop the active transfer first.") return end
-    if not guildBankOpen() then msg("Open your live guild bank first.") return end
-    if InCombatLockdown and InCombatLockdown() then msg("Cannot transfer in combat.") return end
+    local mode=bankOpen() and "guild" or (personalBankOpen() and "personal" or nil)
+    if not mode then msg("Open your live bank first.") return end
     if CursorHasItem and CursorHasItem() then msg("Clear your cursor first.") return end
+    if mode=="personal" then
+        local queue=buildQueue("deposit","All","personal")
+        if #queue==0 then msg("No matching items to deposit.") return end
+        observations={confirmed=0};pendingObservations={}
+        job={direction="deposit",category="All",mode="personal",queue=queue,
+             index=1,moved=0,skipped=0,reserved={},guildPlanned={},phase="transfer"}
+        startWatcher()
+        if refreshPanel then refreshPanel() end
+        msg("Deposit All: "..#queue.." equipment stacks queued for regular bank.")
+        return
+    end
     local stages={}
     for _,key in ipairs(tabKeys) do
         if hasDepositableItems(key) then
@@ -555,14 +594,25 @@ end
 
 local function startWithdrawAll()
     if job then msg("Stop the active transfer first.") return end
-    if not guildBankOpen() then msg("Open your live guild bank first.") return end
-    if InCombatLockdown and InCombatLockdown() then msg("Cannot transfer in combat.") return end
+    local mode=bankOpen() and "guild" or (personalBankOpen() and "personal" or nil)
+    if not mode then msg("Open your live bank first.") return end
     if CursorHasItem and CursorHasItem() then msg("Clear your cursor first.") return end
     if not attunementReady() then msg("Attunement APIs unavailable; nothing withdrawn.") return end
     -- Withdraw All cannot use partial-stack capacity safely without relying
     -- on AutoStore's undocumented merge behavior. Avoid touring six tabs when
     -- every carried bag slot is already occupied.
     if not freeBagSlot() then msg("No empty bag slots; Withdraw All not started.") return end
+    if mode=="personal" then
+        local queue=buildQueue("withdraw","All","personal")
+        if #queue==0 then msg("No eligible attunable equipment in regular bank.") return end
+        observations={confirmed=0};pendingObservations={}
+        job={direction="withdraw",category="All",mode="personal",queue=queue,
+             index=1,moved=0,skipped=0,reserved={},guildPlanned={},phase="transfer"}
+        startWatcher()
+        if refreshPanel then refreshPanel() end
+        msg("Withdraw All: "..#queue.." attunable stacks queued from regular bank.")
+        return
+    end
     local stages={}
     local first=currentTab()
     if first and first<=6 then stages[#stages+1]={category="All",tab=first} end
@@ -633,7 +683,21 @@ local function advanceStage(j,overflow)
     end
 end
 
-addon:SetScript("OnUpdate",function(self,elapsed)
+-- The watcher below only runs during a bank session (guild bank, regular
+-- bank or Jeeves) or a transfer. It is started by the real game events
+-- BANKFRAME_OPENED / GUILDBANKFRAME_OPENED, which fire for Jeeves too, and
+-- stops itself once no bank is live and nothing is transferring. Outside a
+-- bank, Gear Mover does no per-frame work at all.
+local onUpdate
+local watching = false
+startWatcher = function()
+    if not watching then
+        watching = true
+        detectionTick = 0
+        addon:SetScript("OnUpdate", onUpdate)
+    end
+end
+onUpdate = function(self,elapsed)
     -- Detect transitions even if a bank addon handles UI through its own messages.
     detectionTick = detectionTick + elapsed
     if detectionTick >= 0.3 then
@@ -647,6 +711,13 @@ addon:SetScript("OnUpdate",function(self,elapsed)
             if panel then panel:Hide() end
         end
         wasBankAvailable = available
+        -- guildActive/personalActive keep the watcher alive while a bank that
+        -- has just opened is still loading (e.g. guild tab data not ready).
+        if not available and not job and not guildActive and not personalActive then
+            watching = false
+            self:SetScript("OnUpdate", nil)
+            return
+        end
     end
     if not job then return end
     -- Guild responses can lag; inspect pending source slots at a modest cadence
@@ -716,7 +787,6 @@ addon:SetScript("OnUpdate",function(self,elapsed)
             job.phase="transfer"
         elseif currentTab()~=job.tab then stop("Guild tab changed during transfer") return end
     elseif not personalBankOpen() then stop("Regular bank closed") return end
-    if InCombatLockdown and InCombatLockdown() then stop("Transfer stopped: combat") return end
     if CursorHasItem and CursorHasItem() then stop("Transfer stopped: item on cursor") return end
     local entry=job.queue[job.index]
     if not entry then advanceStage(job,job.overflowBlocked==true) return end
@@ -724,9 +794,11 @@ addon:SetScript("OnUpdate",function(self,elapsed)
     if job.mode=="personal" then
         local sourceBag,sourceSlot=entry.bag,entry.slot
         local link=GetContainerItemLink(sourceBag,sourceSlot)
-        if link and link==entry.link and itemCategory(link)==job.category and
+        local category=itemCategory(link)
+        if link and link==entry.link and category and
+           (job.category=="All" or category==job.category) and
            (job.direction~="deposit" or allowedDeposit(link,sourceBag,sourceSlot)) and
-           (job.direction~="withdraw" or job.category~="Weapon" or isAttunableForCurrentCharacter(link)) then
+           (job.direction~="withdraw" or (job.category~="All" and job.category~="Weapon") or isAttunableForCurrentCharacter(link)) then
             local _,_,locked=GetContainerItemInfo(sourceBag,sourceSlot)
             if locked then job.skipped=job.skipped+1
             else
@@ -737,7 +809,13 @@ addon:SetScript("OnUpdate",function(self,elapsed)
                 local id
                 if not merging then destBag,destSlot,id=emptySlot(containers,job.reserved) end
                 if not destBag then stop("No empty destination slots") return end
-                local ok,err=movePersonal(sourceBag,sourceSlot,destBag,destSlot)
+                -- Some clients protect item pickup during combat. Do not assume
+                -- Synastria permits it: abort safely if the client rejects it.
+                local called,ok,err=pcall(movePersonal,sourceBag,sourceSlot,destBag,destSlot)
+                if not called then
+                    stop("Client rejected bank item pickup; check cursor and combat restrictions")
+                    return
+                end
                 if ok then
                     if id then job.reserved[id]=true end
                     job.moved=job.moved+1
@@ -775,12 +853,21 @@ addon:SetScript("OnUpdate",function(self,elapsed)
                         return
                     end
                 else
-                    PickupContainerItem(entry.bag,entry.slot)
+                    local picked=pcall(PickupContainerItem,entry.bag,entry.slot)
+                    if not picked then
+                        stop("Client rejected guild-bank pickup; check combat restrictions")
+                        return
+                    end
                     if CursorHasItem and CursorHasItem() then
-                        PickupGuildBankItem(tab,dest)
+                        local placed=pcall(PickupGuildBankItem,tab,dest)
+                        if not placed then
+                            pcall(PickupContainerItem,entry.bag,entry.slot)
+                            stop("Client rejected guild-bank placement; check cursor")
+                            return
+                        end
                         if CursorHasItem and CursorHasItem() then
-                            PickupContainerItem(entry.bag,entry.slot)
-                            if CursorHasItem and CursorHasItem() then
+                            local restored=pcall(PickupContainerItem,entry.bag,entry.slot)
+                            if not restored or (CursorHasItem and CursorHasItem()) then
                                 stop("Could not restore item; clear cursor")
                                 return
                             end
@@ -803,8 +890,11 @@ addon:SetScript("OnUpdate",function(self,elapsed)
     else
         local tab=job.tab
         local link=GetGuildBankItemLink(tab,entry.slot)
-        if link and (job.category=="All" or itemCategory(link)==job.category) and link==entry.link then
-            if (job.category=="All" or job.category=="Weapon") and
+        local category=itemCategory(link)
+        if link and category and (job.category=="All" or category==job.category) and link==entry.link then
+            local _,_,locked=GetGuildBankItemInfo(tab,entry.slot)
+            if locked then job.skipped=job.skipped+1
+            elseif (job.category=="All" or job.category=="Weapon") and
                not isAttunableForCurrentCharacter(link) then job.skipped=job.skipped+1
             else
                 if not freeBagSlot() then stop("No completely empty bag slot") return end
@@ -814,19 +904,53 @@ addon:SetScript("OnUpdate",function(self,elapsed)
                     return
                 end
                 local before=guildCount(tab,entry.slot)
-                AutoStoreGuildBankItem(tab,entry.slot)
+                if not pcall(AutoStoreGuildBankItem,tab,entry.slot) then
+                    stop("Client rejected guild-bank withdrawal; check combat restrictions")
+                    return
+                end
                 job.moved=job.moved+1
                 observeLater({sourceType="guild",tab=tab,slot=entry.slot,link=link,count=before})
             end
         else job.skipped=job.skipped+1 end
     end
     if job.index>#job.queue then advanceStage(job,job.overflowBlocked==true) end
-end)
+end
 
 local function guildConfigKey()
     local guild=GetGuildInfo("player") or "NoGuild"
     local realm=GetRealmName() or "UnknownRealm"
     return realm.."/"..guild
+end
+-- Deposit rules are shared by every character on the account (1.3.9+).
+-- Before 1.3.9 they lived inside each realm/guild entry. Seed the shared copy
+-- once: the current guild's rules if any were changed from default, else the
+-- first (sorted) guild entry with changed rules, else defaults. Old per-guild
+-- fields stay in place (and keep being written) so a downgrade still works.
+local RULE_FIELDS={"minDepositQuality","skipMythic","skipCompletedBoE","skipAccountAttunedBoE"}
+local function hasCustomRules(t)
+    if type(t)~="table" then return false end
+    return (tonumber(t.minDepositQuality) or 0)>0 or t.skipMythic==true or
+        t.skipCompletedBoE==true or t.skipAccountAttunedBoE==true
+end
+local function depositRules()
+    if type(GearMoverDB.depositRules)=="table" then return GearMoverDB.depositRules end
+    local guilds=GearMoverDB.guilds
+    local source=guilds[guildConfigKey()]
+    if not hasCustomRules(source) then
+        source=nil
+        local keys={}
+        for k,v in pairs(guilds) do
+            if type(k)=="string" and hasCustomRules(v) then keys[#keys+1]=k end
+        end
+        table.sort(keys)
+        if keys[1] then source=guilds[keys[1]] end
+    end
+    local rules={}
+    if source then
+        for _,field in ipairs(RULE_FIELDS) do rules[field]=source[field] end
+    end
+    GearMoverDB.depositRules=rules
+    return rules
 end
 local function saveTabs()
     if not GearMoverDB then GearMoverDB={guilds={}} end
@@ -837,6 +961,13 @@ local function saveTabs()
         for _,tab in ipairs(configuredTabList(key)) do copy[#copy+1]=tab end
         stored[key]=copy
     end
+    local rules=depositRules()
+    rules.minDepositQuality=minDepositQuality
+    rules.skipMythic=skipMythic
+    rules.skipCompletedBoE=skipCompletedBoE
+    rules.skipAccountAttunedBoE=skipAccountAttunedBoE
+    rules.keepAttunable=keepAttunable
+    -- Downgrade copy for 1.3.8 and older, which read rules per guild.
     stored.minDepositQuality=minDepositQuality
     stored.skipMythic=skipMythic
     stored.skipCompletedBoE=skipCompletedBoE
@@ -926,11 +1057,13 @@ local function loadTabs()
     transferMs=savedMs and math.max(10,math.min(200,math.floor(savedMs+0.5))) or 80
     interval=transferMs/1000
     local stored=GearMoverDB.guilds[guildConfigKey()] or {}
-    minDepositQuality=tonumber(stored.minDepositQuality) or 0
+    local rules=depositRules()
+    minDepositQuality=tonumber(rules.minDepositQuality) or 0
     if minDepositQuality<0 or minDepositQuality>5 then minDepositQuality=0 end
-    skipMythic=stored.skipMythic==true
-    skipCompletedBoE=stored.skipCompletedBoE==true
-    skipAccountAttunedBoE=stored.skipAccountAttunedBoE==true
+    skipMythic=rules.skipMythic==true
+    skipCompletedBoE=rules.skipCompletedBoE==true
+    skipAccountAttunedBoE=rules.skipAccountAttunedBoE==true
+    keepAttunable=rules.keepAttunable==true
     for _,key in ipairs(tabKeys) do
         local value=stored[key]
         local list={}
@@ -961,18 +1094,33 @@ end
 -- committed together; closing the interface without Save leaves them alone.
 local registerConfigPanel
 -- The 3.3.5 InterfaceOptionsFrame_OpenToCategory helper only clicks buttons
--- currently rendered in the scrollable AddOns list. Scroll to our registered
--- panel before selecting it; otherwise it can leave the previous panel open.
+-- currently rendered in the scrollable AddOns list, so our row may need to be
+-- scrolled into view first.
+--
+-- 1.3.9 and older did that by writing the list's offset directly
+-- (FauxScrollFrame_SetOffset). That left the scrollbar at the top while the
+-- rows were shifted down: the first rows - Synastria's "[Syn] ..." pages,
+-- which sort first - vanished with no way to scroll back (no scrollbar at all
+-- on short lists), for the rest of the session. Reported by a user.
+--
+-- Now: only scroll if our row isn't on screen, and only by moving the list's
+-- own scrollbar (as TradeskillInfo does), so the scrollbar and rows always
+-- agree and every entry stays reachable. Works the same under ElvUI, which
+-- reskins these frames but keeps their names and behavior.
+local function optionsRowShown(buttons, panel)
+    for i = 1, #buttons do
+        local b = buttons[i]
+        if b.element == panel and b:IsShown() then return true end
+    end
+    return false
+end
 local function openOptionsCategory(panel)
     if not panel or type(InterfaceOptionsFrame_OpenToCategory) ~= "function" then return false end
     local categories = _G.INTERFACEOPTIONS_ADDONCATEGORIES
-    local found, visibleIndex = false, 0
+    local found = false
     if type(categories) == "table" then
         for _, category in ipairs(categories) do
-            if not category.hidden then
-                if category == panel then found = true; break end
-                visibleIndex = visibleIndex + 1
-            end
+            if category == panel then found = true; break end
         end
     end
     if not found then return false end
@@ -984,14 +1132,39 @@ local function openOptionsCategory(panel)
         InterfaceOptionsFrame_Show()
     end
     if _G.InterfaceOptionsFrameTab2 then InterfaceOptionsFrameTab2:Click() end
-    if type(_G.InterfaceAddOnsList_Update) == "function" then
-        InterfaceAddOnsList_Update()
+
+    local list = _G.InterfaceOptionsFrameAddOns
+    local buttons = list and list.buttons
+    local bar = _G.InterfaceOptionsFrameAddOnsListScrollBar
+    local scroll = _G.InterfaceOptionsFrameAddOnsList
+    local step = type(buttons) == "table" and buttons[1] and buttons[1]:GetHeight() or 0
+    -- Repair: if any addon (an older Gear Mover, AttuneSight 1.0.0, or a
+    -- third-party addon with the same mistake) left the rows out of step
+    -- with the scrollbar, put them back where the scrollbar says they are.
+    -- With no visible scrollbar the list must start at its first row.
+    if step > 0 and scroll and bar and bar.GetValue and bar.IsVisible
+        and type(_G.FauxScrollFrame_GetOffset) == "function"
+        and type(_G.FauxScrollFrame_SetOffset) == "function"
+        and type(_G.InterfaceAddOnsList_Update) == "function" then
+        local expected = bar:IsVisible() and math.floor((bar:GetValue() or 0) / step + 0.5) or 0
+        if FauxScrollFrame_GetOffset(scroll) ~= expected then
+            FauxScrollFrame_SetOffset(scroll, expected)
+            InterfaceAddOnsList_Update()
+        end
     end
-    if type(_G.FauxScrollFrame_SetOffset) == "function"
-        and _G.InterfaceOptionsFrameAddOnsList then
-        -- The row position is zero-based; leave the target near the top.
-        FauxScrollFrame_SetOffset(InterfaceOptionsFrameAddOnsList, math.max(0, visibleIndex - 1))
-        if type(_G.InterfaceAddOnsList_Update) == "function" then InterfaceAddOnsList_Update() end
+    if type(buttons) == "table" and buttons[1] and bar and bar.GetMinMaxValues and bar.SetValue
+        and not optionsRowShown(buttons, panel) then
+        if step > 0 then
+            local _, maxValue = bar:GetMinMaxValues()
+            local maxScroll = math.floor((maxValue or 0) / step + 0.5)
+            local offset = 0
+            -- Page down one screen at a time until our row appears.
+            while true do
+                bar:SetValue(offset * step)
+                if optionsRowShown(buttons, panel) or offset >= maxScroll then break end
+                offset = math.min(maxScroll, offset + #buttons)
+            end
+        end
     end
     local ok, err = pcall(InterfaceOptionsFrame_OpenToCategory, panel)
     if not ok then msg("Settings navigation failed: " .. tostring(err)); return false end
@@ -1097,7 +1270,7 @@ local function createConfigPanel()
         })
     end
 
-    label("Deposit rules",24,-236,"GameFontNormal")
+    label("Deposit rules (all characters)",24,-236,"GameFontNormal")
     label("Minimum quality",36,-261)
     local qualityNames={[0]="Any quality (0)",[1]="Common (1)",[2]="Uncommon (2)",
         [3]="Rare (3)",[4]="Epic (4)",[5]="Legendary (5)"}
@@ -1139,19 +1312,23 @@ local function createConfigPanel()
     local accountBox=checkSetting(-327,"Skip attuned variant BoEs",{
         "Skips BoE gear you've attuned a variant affix of to sell/manually move"
     })
+    local keepBox=checkSetting(-351,"Keep gear I can still attune",{
+        "Deposits leave behind gear this character can still attune.",
+        "If Synastria can't tell yet, the item is kept."
+    })
 
-    label("Transfer interval",36,-358,"GameFontNormal")
+    label("Transfer interval",36,-382,"GameFontNormal")
     local pendingMs=80
     local slider=S.Slider(page,248,10,200,1,function(v)
         pendingMs=math.floor(v+0.5)
     end,function(v)return tostring(math.floor(v+0.5)).." ms" end)
-    slider:SetPoint("TOPLEFT",page,"TOPLEFT",46,-378)
+    slider:SetPoint("TOPLEFT",page,"TOPLEFT",46,-402)
     help(slider,"Transfer interval",{
         "Delay between item transfer attempts (10-200 ms).",
         "80 ms is the default. Lower values may cause failed moves or throttling.",
         "Below 50 ms is experimental."
     })
-    local warning=label("WARNING: Below 50 ms may cause instability.",38,-412,"GameFontNormalSmall")
+    local warning=label("WARNING: Below 50 ms may cause instability.",38,-436,"GameFontNormalSmall")
     warning:SetTextColor(1,0.25,0.25)
 
     local revert=S.Button(page,"Revert changes","secondary",126,function()
@@ -1172,6 +1349,7 @@ local function createConfigPanel()
         skipMythic=mythicBox.on==true
         skipCompletedBoE=completedBox.on==true
         skipAccountAttunedBoE=accountBox.on==true
+        keepAttunable=keepBox.on==true
         transferMs=pendingMs
         interval=transferMs/1000
         saveTabs()
@@ -1195,6 +1373,7 @@ local function createConfigPanel()
         mythicBox:SetChecked(skipMythic)
         completedBox:SetChecked(skipCompletedBoE)
         accountBox:SetChecked(skipAccountAttunedBoE)
+        keepBox:SetChecked(keepAttunable)
         pendingMs=transferMs
         slider:SetValue(transferMs)
     end)
@@ -1250,6 +1429,31 @@ local function tooltipButton(b,textFn)
         b:SetScript("OnEnter",enter)
         b:SetScript("OnLeave",function()GameTooltip:Hide()end)
     end
+end
+-- Hover count: how many stacks the button would move right now. Computed only
+-- when a tooltip opens (no background scanning), using the same queue builder
+-- the transfer uses so the number can't drift from what actually moves.
+local function countSuffix(direction,key)
+    if job then return "" end
+    local mode=bankOpen() and "guild" or (personalBankOpen() and "personal" or nil)
+    if not mode then return "" end
+    local tab=mode=="guild" and currentTab() or nil
+    if mode=="guild" and not tab then return "" end
+    local n=0
+    for _,e in ipairs(buildQueue(direction,key,mode,tab)) do
+        if direction=="deposit" and mode=="guild" then
+            -- Guild banks reject soulbound items, and Deposit All only
+            -- visits categories that have assigned tabs.
+            if (key~="All" or #selectedTabs(e.category)>0) and
+               not isSoulbound(e.bag,e.slot) then n=n+1 end
+        else
+            n=n+1
+        end
+    end
+    if direction=="withdraw" and mode=="guild" then
+        return " ("..n.." on this tab)"
+    end
+    return " ("..n..")"
 end
 local function actionAll()
     if job then stop("Stopped by user")
@@ -1327,9 +1531,28 @@ createPanel=function()
         f:SetAllPoints(panel)
         views[n]=f
     end
+    -- Press feedback. MaterialCraftUI swaps to the pushed face; like Blizzard's
+    -- own panel buttons, the label also sinks 1px while held. Shared handlers:
+    -- nothing is allocated per press and nothing runs while idle.
+    local function labelPress(self,button)
+        if button~="LeftButton" or not self:IsEnabled() then return end
+        self.label:SetPoint("CENTER",self,"CENTER",1,-1)
+    end
+    local function labelRelease(self)
+        self.label:SetPoint("CENTER",self,"CENTER",0,0)
+    end
+    local function labelHide(self)
+        labelRelease(self)
+        -- The bank can close mid-press; don't reopen with a stuck pushed face.
+        if self.down then self.down=false;self:SetKind(self.kind) end
+    end
     local function textButton(parent,text,width,x,y,handler)
         local b=S.Button(parent,text,"secondary",width,handler)
         b:SetPoint("TOPLEFT",parent,"TOPLEFT",x,y)
+        b:HookScript("OnMouseDown",labelPress)
+        b:HookScript("OnMouseUp",labelRelease)
+        b:HookScript("OnLeave",labelRelease)
+        b:HookScript("OnHide",labelHide)
         return b
     end
     -- Bagnon/oGlow-style additive OVERLAY, but shaped for the control.
@@ -1381,12 +1604,17 @@ createPanel=function()
         button.edgeOpacity=opacity or 0.85
         return button
     end
-    local function paintDirection(button,active,color)
-        button:SetKind(active and "selected" or "secondary")
+    local function tintGlow(button,color,alpha)
         for _,tex in ipairs(button.edgeGlow) do
             tex:SetVertexColor(color[1],color[2],color[3])
-            tex:SetAlpha(active and button.edgeOpacity or 0)
+            tex:SetAlpha(alpha)
         end
+    end
+    -- Only the Deposit/Withdraw toggles use the "selected" (pushed) face.
+    -- Action buttons keep the raised face so a click visibly pushes them in.
+    local function paintDirection(button,active,color)
+        button:SetKind(active and "selected" or "secondary")
+        tintGlow(button,color,active and button.edgeOpacity or 0)
     end
     local function separator(parent,x,y,height)
         local t=parent:CreateTexture(nil,"ARTWORK")
@@ -1404,11 +1632,15 @@ createPanel=function()
         local lab=views[1]:CreateFontString(nil,"OVERLAY","GameFontHighlight")
         lab:SetPoint("TOPLEFT",views[1],"TOPLEFT",20,y-4)
         lab:SetText(c.label)
-        textButton(views[1],"Deposit",105,84,y,function()start("deposit",key)end)
-        textButton(views[1],"Withdraw",105,198,y,function()start("withdraw",key)end)
+        tooltipButton(textButton(views[1],"Deposit",105,84,y,function()start("deposit",key)end),
+            function()return "Deposit "..tabLabels[key]..countSuffix("deposit",key)end)
+        tooltipButton(textButton(views[1],"Withdraw",105,198,y,function()start("withdraw",key)end),
+            function()return "Withdraw "..tabLabels[key]..countSuffix("withdraw",key)end)
     end
-    textButton(views[1],"Deposit All",93,18,-173,startAll)
-    textButton(views[1],"Withdraw All",98,118,-173,startWithdrawAll)
+    tooltipButton(textButton(views[1],"Deposit All",93,18,-173,startAll),
+        function()return "Deposit All"..countSuffix("deposit","All")end)
+    tooltipButton(textButton(views[1],"Withdraw All",98,118,-173,startWithdrawAll),
+        function()return "Withdraw All"..countSuffix("withdraw","All")end)
     local fullStop=textButton(views[1],"Stop",87,224,-173,function()stop("Stopped by user")end)
 
     local function setDirection(direction)
@@ -1426,12 +1658,28 @@ createPanel=function()
         local key=c.key
         local b=edgeGlow(textButton(views[2],({"Cl","Le","Ma","Pl","Wp"})[i],35,12+(i-1)*44,-48,
             function()categoryAction(key)end))
-        tooltipButton(b,function()return (transferDirection=="deposit" and "Deposit " or "Withdraw ")..tabLabels[key]end)
+        tooltipButton(b,function()return (transferDirection=="deposit" and "Deposit " or "Withdraw ")..tabLabels[key]..countSuffix(transferDirection,key)end)
         compactCategories[#compactCategories+1]=b
     end
     local compactAll=edgeGlow(textButton(views[2],"All",42,234,-48,actionAll))
-    tooltipButton(compactAll,function()return job and "Stop transfer" or (transferDirection=="deposit" and "Deposit All" or "Withdraw All")end)
+    tooltipButton(compactAll,function()return job and "Stop transfer" or ((transferDirection=="deposit" and "Deposit All" or "Withdraw All")..countSuffix(transferDirection,"All"))end)
 
+    -- Icon press: the artwork sinks 1px down-right, shrinks 2px and darkens
+    -- while held, then snaps back. Only moves/tints the existing texture.
+    local function iconPress(self,button)
+        if button~="LeftButton" then return end
+        local art=self.art
+        art:ClearAllPoints()
+        art:SetPoint("TOPLEFT",self,"TOPLEFT",3,-3)
+        art:SetPoint("BOTTOMRIGHT",self,"BOTTOMRIGHT",-1,1)
+        art:SetVertexColor(0.7,0.7,0.7)
+    end
+    local function iconRelease(self)
+        local art=self.art
+        art:ClearAllPoints()
+        art:SetAllPoints(self)
+        art:SetVertexColor(1,1,1)
+    end
     -- Original user-supplied artwork, converted to TGA only for client texture compatibility.
     local function imageButton(parent,x,texture,fn,textFn)
         local b=CreateFrame("Button",nil,parent)
@@ -1441,6 +1689,9 @@ createPanel=function()
         art:SetAllPoints()
         art:SetTexture(texture)
         b.art=art
+        b:SetScript("OnMouseDown",iconPress)
+        b:SetScript("OnMouseUp",iconRelease)
+        b:SetScript("OnHide",iconRelease)
         -- Square buttons do not need eight separate 9-slice regions.
         -- The source glow has a transparent middle; a single centered overlay
         -- preserves the artwork and reduces retained UI textures per icon.
@@ -1465,11 +1716,11 @@ createPanel=function()
         local key=c.key
         iconCategories[#iconCategories+1]=imageButton(views[3],60+(i-1)*42,ICONS[key],
             function()categoryAction(key)end,
-            function()return (transferDirection=="deposit" and "Deposit " or "Withdraw ")..tabLabels[key]end)
+            function()return (transferDirection=="deposit" and "Deposit " or "Withdraw ")..tabLabels[key]..countSuffix(transferDirection,key)end)
     end
     separator(views[3],270,-18,28)
     local iconAll=imageButton(views[3],280,ICONS.All,actionAll,
-        function()return job and "Stop transfer" or (transferDirection=="deposit" and "Deposit All" or "Withdraw All")end)
+        function()return job and "Stop transfer" or ((transferDirection=="deposit" and "Deposit All" or "Withdraw All")..countSuffix(transferDirection,"All"))end)
 
     local viewButton=S.Button(panel,">","secondary",23,function()
         layoutMode=layoutMode%3+1
@@ -1494,24 +1745,12 @@ createPanel=function()
         local current=transferDirection=="deposit" and GREEN or AMBER
         paintDirection(compactDeposit,transferDirection=="deposit",GREEN)
         paintDirection(compactWithdraw,transferDirection=="withdraw",AMBER)
-        for _,b in ipairs(compactCategories) do paintDirection(b,true,current)end
-        paintDirection(compactAll,true,current)
+        for _,b in ipairs(compactCategories) do tintGlow(b,current,b.edgeOpacity)end
+        tintGlow(compactAll,current,compactAll.edgeOpacity)
         iconDirection.art:SetTexture(ICONS[transferDirection=="deposit" and "Deposit" or "Withdraw"])
-        for _,b in ipairs(iconCategories) do
-            for _,tex in ipairs(b.edgeGlow) do
-                tex:SetVertexColor(current[1],current[2],current[3])
-                tex:SetAlpha(b.edgeOpacity)
-            end
-        end
-        -- Avoid creating a temporary table on every panel refresh.
-        for _,tex in ipairs(iconDirection.edgeGlow) do
-            tex:SetVertexColor(current[1],current[2],current[3])
-            tex:SetAlpha(iconDirection.edgeOpacity)
-        end
-        for _,tex in ipairs(iconAll.edgeGlow) do
-            tex:SetVertexColor(current[1],current[2],current[3])
-            tex:SetAlpha(iconAll.edgeOpacity)
-        end
+        for _,b in ipairs(iconCategories) do tintGlow(b,current,b.edgeOpacity)end
+        tintGlow(iconDirection,current,iconDirection.edgeOpacity)
+        tintGlow(iconAll,current,iconAll.edgeOpacity)
     end
     refreshPanel()
     panel:Hide()
@@ -1531,18 +1770,21 @@ addon:SetScript("OnEvent",function(self,event)
         registerConfigPanel()
     elseif event=="PLAYER_LOGIN" then
         loadTabs();createPanel();loadUiPreference();registerConfigPanel()
+        -- One check in case login/reload happens with a bank already open;
+        -- the watcher switches itself off within 0.3 s if none is.
+        startWatcher()
     elseif event=="GUILDBANKBAGSLOTS_CHANGED" then
         if job and job.mode=="guild" and job.phase=="waiting" and currentTab()==job.tab then
             job.tabUpdated=true
         end
     elseif event=="GUILDBANKFRAME_OPENED" then
-        guildActive=true; if not job then loadTabs() end; createPanel();panel:Show()
+        guildActive=true; if not job then loadTabs() end; createPanel();panel:Show();startWatcher()
     elseif event=="GUILDBANKFRAME_CLOSED" then
         guildActive=false
         if job and job.mode=="guild" then stop("Guild bank closed") end
         if panel and not bankOpen() and not personalBankOpen() then panel:Hide() end
     elseif event=="BANKFRAME_OPENED" then
-        personalActive=true; createPanel();panel:Show()
+        personalActive=true; createPanel();panel:Show();startWatcher()
     elseif event=="BANKFRAME_CLOSED" then
         personalActive=false
         if job and job.mode=="personal" then stop("Regular bank closed") end
